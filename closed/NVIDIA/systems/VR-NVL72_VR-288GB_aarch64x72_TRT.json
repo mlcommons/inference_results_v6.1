@@ -5,7 +5,7 @@
     "accelerator_interconnect_topology": "",
     "accelerator_memory_capacity": "288 GB",
     "accelerator_memory_configuration": "HBM4",
-    "accelerator_model_name": "NVIDIA VeraRubin",
+    "accelerator_model_name": "NVIDIA Vera Rubin",
     "accelerator_on-chip_memories": "",
     "accelerators_per_node": 4,
     "boot_firmware_version": "",
@@ -28,7 +28,7 @@
     "host_processors_per_node": 2,
     "host_storage_capacity": "for each 4-GPU node: 2 TB SSD, 5 TB CIFS",
     "host_storage_type": "NVMe SSD, CIFS mounted disk storage",
-    "hw_notes": "NVIDIA VeraRubin NVL72, 2300W TGP Per GPU",
+    "hw_notes": "NVIDIA Vera Rubin NVL72, 2300W TGP Per GPU",
     "management_firmware_version": "",
     "network_speed_mbit": "",
     "nics_enabled_connected": "",
@@ -45,7 +45,7 @@
     "status": "preview",
     "submitter": "NVIDIA",
     "sw_notes": "",
-    "system_name": "NVIDIA VeraRubin NVL72 (72x VR-288GB_aarch64)",
+    "system_name": "NVIDIA Vera Rubin NVL72 (72x VR-288GB_aarch64)",
     "system_type": "datacenter",
     "system_type_detail": "N/A"
 }
