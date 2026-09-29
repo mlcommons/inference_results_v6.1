@@ -1,0 +1,362 @@
+# GPT-OSS-120B
+
+## Support Matrix
+
+See [Docker support](../../../../configs/DOCKER_SUPPORT.md) and [SLURM support](../../../../configs/SLURM_SUPPORT.md) for per-system, per-scenario support details.
+
+## Getting Started
+
+### Download Model and Dataset
+
+The GPT-OSS-120B benchmark uses separate datasets for accuracy and performance runs.
+
+Please refer to the reference implementation README on mlcommons/inference for instructions to download datasets and model: [https://github.com/mlcommons/inference/tree/master/language/gpt-oss-120b#model-and-dataset-download](https://github.com/mlcommons/inference/tree/master/language/gpt-oss-120b#model-and-dataset-download)
+
+**Freshly downloaded dataset layout:**
+
+After following the reference instructions, the downloaded dataset directory looks like this:
+
+```
+gpt-oss_data/
+├── acc/
+│   ├── acc_eval_compliance_gpqa.parquet
+│   ├── acc_eval_ref.parquet
+│   ├── calibration_unique_sampled1024.parquet # not needed for benchmarking
+│   ├── input_ids_padded_acc_eval.npy
+│   └── input_lens_acc_eval.npy
+├── gpt-oss-data.md5
+└── perf/
+    ├── input_ids_padded_perf_eval.npy
+    ├── input_lens_perf_eval.npy
+    └── perf_eval_ref.parquet
+```
+
+### Prepare Data
+
+**Note:** `/work/build/data` is a symlink that points to `$MLPERF_SCRATCH_PATH/data`. Once you have the freshly downloaded data, copy/mv the `acc/` and `perf/` directories into `/work/build/data/gpt-oss/v4/`. The harness reads the `_acc_eval` / `_perf_eval` suffixed files directly based on `--test_mode` — no renaming or symlinking is required.
+
+**Dataset Statistics:**
+
+
+| Dataset             | Samples | Max ISL | Max OSL | Benchmarks                                             |
+| ------------------- | ------- | ------- | ------- | ------------------------------------------------------ |
+| Accuracy            | 4,395   | 2,871   | 32,768  | AIME (240), GPQA (990), LiveCodeBench (3,165)          |
+| Performance         | 6,396   | 15,330  | 10,240  | pubmed_summarization (synthetic)                       |
+| Compliance (TEST07) | 990     | 2,871   | 10,240  | GPQA subset (accuracy verification in perf mode)       |
+| Compliance (TEST09) | 6,396   | 15,330  | 10,240  | Same as Performance (output token length verification) |
+
+
+### Compliance Data Preprocessing
+
+For TEST07 compliance testing, you need to preprocess the GPQA compliance dataset:
+
+```bash
+# Preprocess compliance data for TEST07
+python src/nv_mlpinf/benchmarks/gpt_oss_120b/preprocess_compliance_data.py \
+    --input-file build/data/gpt-oss/v4/acc/acc_eval_compliance_gpqa.parquet \
+    --output-dir build/data/gpt-oss/v4/compliance/test07
+```
+
+This creates (TEST07 runs in PerformanceOnly mode, so files use the `_perf_eval` suffix the loader expects):
+
+```
+build/data/gpt-oss/v4/compliance/test07/
+├── input_ids_padded_perf_eval.npy    # Tokenized inputs (990 samples)
+└── input_lens_perf_eval.npy          # Actual input lengths
+```
+
+### Initialize Accuracy/Compliance Submodules
+
+Accuracy runs and TEST07/TEST09 compliance verification build a Python venv (`gptoss-acc-venv`) from `src/nv_mlpinf/benchmarks/gpt_oss_120b/requirements.accuracy.txt`, which installs `LiveCodeBench` and `prm800k` from local paths. Those paths are git submodules of `3rdparty/mlc-inference` and are **not initialized by default**. Run this once before any accuracy or audit run:
+
+```bash
+# From the repository root
+cd closed/NVIDIA/3rdparty/mlc-inference
+git submodule update --init --recursive \
+    language/deepseek-r1/submodules/LiveCodeBench \
+    language/deepseek-r1/submodules/prm800k
+```
+
+`closed/NVIDIA/3rdparty/mlc-inference/language/gpt-oss-120b/submodules/{LiveCodeBench,prm800k}` are symlinks to the deepseek-r1 submodule paths above, so initializing them there populates both locations. Verify with:
+
+```bash
+ls 3rdparty/mlc-inference/language/gpt-oss-120b/submodules/LiveCodeBench/pyproject.toml
+```
+
+Skipping this step will surface as a verifier failure with:
+`ERROR: file:///work/3rdparty/mlc-inference/language/gpt-oss-120b/submodules/LiveCodeBench ... does not appear to be a Python project: neither 'setup.py' nor 'pyproject.toml' found.`
+
+---
+
+**Verify the final dataset directory:**
+
+After preparing the data and running the TEST07 preprocessing, the final layout should match this:
+
+```
+build/data/gpt-oss/v4/
+├── acc/
+│   ├── acc_eval_compliance_gpqa.parquet
+│   ├── acc_eval_ref.parquet
+│   ├── input_ids_padded_acc_eval.npy
+│   └── input_lens_acc_eval.npy
+├── compliance/
+│   └── test07/
+│       ├── input_ids_padded_perf_eval.npy
+│       └── input_lens_perf_eval.npy
+└── perf/
+    ├── input_ids_padded_perf_eval.npy
+    ├── input_lens_perf_eval.npy
+    └── perf_eval_ref.parquet
+```
+
+## Base Image
+
+GPT-OSS-120B uses TensorRT-LLM containers for both server and harness/client tasks. For Docker runs, use the public MLPerf TensorRT-LLM images shown below. For nv-sflow runs, the selected `slurm_env_sflow.yaml` is authoritative because each supported system/scenario pins its own `CONTAINER_IMAGE`.
+
+For v6.1.2, all GB300 NVL72 Offline and Server nv-sflow configurations for x4, x8, and x72 use the TensorRT-LLM 1.3.0 RC14 release container:
+
+```text
+docker://nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14
+```
+
+Internal validation showed approximately 5-7% higher performance for GPT-OSS-120B GB300 Offline and Server scenarios with this container compared with the previous image. GB300 Interactive and non-GB300 configurations continue to use the image pinned by their own `slurm_env_sflow.yaml` files unless explicitly overridden.
+
+| System or configuration                                           | Arch    | Default image                                                                                                           | Scope                |
+| ----------------------------------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| B200-SXM-180GBx8, B300-SXM-270GBx8                                | x86_64  | `nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86`     | Docker and nv-sflow configs that still pin this image |
+| GB200-NVL72 and GB300-NVL72 Interactive                           | aarch64 | `nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_aarch64` | Configs that still pin this image |
+| GB300-NVL72 Offline and Server x4/x8/x72                          | aarch64 | `docker://nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14`                                                                | nv-sflow `slurm_env_sflow.yaml` configs |
+
+
+## Run the Benchmark in Single Node Using Docker
+
+This section covers all single-node Docker work: image pull, container start, performance, accuracy, and compliance. Check [Docker support](../../../../configs/DOCKER_SUPPORT.md) for the supported single-node systems.
+
+### Prepare the image for single node with Docker
+
+Use the x86 public MLPerf TensorRT-LLM image for single-node Docker systems such as B200/B300.
+
+```bash
+docker pull nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86
+```
+
+### Start Docker and install `nv-mlpinf`
+
+```bash
+cd closed/NVIDIA
+make attach_docker MLPERF_IMAGE=nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86
+pip install -e ".[llm]"
+```
+
+### Test mode selection
+
+The harness selects the dataset and generation config from `--test_mode`:
+
+- `PerformanceOnly`: performance dataset, `max_output_len=10240`
+- `AccuracyOnly`: accuracy dataset, `max_output_len=32768`
+
+### Offline performance and accuracy
+
+```bash
+nv-mlpinf run_llm_server --benchmarks=gpt-oss-120b --scenarios=Offline
+
+nv-mlpinf run_harness --benchmarks=gpt-oss-120b --scenarios=Offline --test_mode=PerformanceOnly
+nv-mlpinf run_harness --benchmarks=gpt-oss-120b --scenarios=Offline --test_mode=AccuracyOnly
+```
+
+### Server performance and accuracy
+
+```bash
+nv-mlpinf run_llm_server --benchmarks=gpt-oss-120b --scenarios=Server
+
+nv-mlpinf run_harness --benchmarks=gpt-oss-120b --scenarios=Server --test_mode=PerformanceOnly
+nv-mlpinf run_harness --benchmarks=gpt-oss-120b --scenarios=Server --test_mode=AccuracyOnly
+```
+
+Exit and re-enter the container to stop a running server before switching scenarios.
+
+### Single-node compliance
+
+GPT-OSS-120B requires `TEST07` and `TEST09`. Both must run in `PerformanceOnly` mode. Set `SCENARIO=Offline` or `SCENARIO=Server`.
+
+```bash
+SCENARIO=Offline
+
+nv-mlpinf run_llm_server --benchmarks=gpt-oss-120b --scenarios=$SCENARIO
+make run_audit_test07 RUN_ARGS="--benchmarks=gpt-oss-120b --scenarios=$SCENARIO --test_mode=PerformanceOnly"
+
+# Restart the server before the next audit test.
+nv-mlpinf run_llm_server --benchmarks=gpt-oss-120b --scenarios=$SCENARIO
+make run_audit_test09 RUN_ARGS="--benchmarks=gpt-oss-120b --scenarios=$SCENARIO --test_mode=PerformanceOnly"
+```
+
+TEST07 has normal run-to-run variance. If it reports an accuracy score near but below the threshold, rerun it once before debugging the setup.
+
+## Run the Benchmark in Multi Node using Slurm + Enroot
+
+This section covers all multi-node SLURM work through `nv-sflow`: image access, performance, accuracy, and compliance. Check [SLURM support](../../../../configs/SLURM_SUPPORT.md) before choosing a system/scenario.
+
+### Prepare the image for multi node with Slurm + Enroot
+
+Do not build a `.sqsh` manually for the nv-sflow path. Each run pulls the container image from `variables.CONTAINER_IMAGE` in the selected `slurm_env_sflow.yaml`.
+
+For v6.1.2, the GB300 Offline and Server x4/x8/x72 configs point to the TensorRT-LLM 1.3.0 RC14 release container. For example, [configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x72/TRTLLM/Offline/slurm_env_sflow.yaml](../../../../configs/gpt_oss_120b/GB300-NVL72_GB300-288GB_aarch64x72/TRTLLM/Offline/slurm_env_sflow.yaml) points to:
+
+```yaml
+variables:
+  CONTAINER_IMAGE:
+    value: "docker://nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14"
+```
+
+GB300 Interactive and non-GB300 configs may point to a different image. Check the `slurm_env_sflow.yaml` paired with the exact system and scenario before launching a full run, and confirm your SLURM compute nodes can pull that image through Pyxis/Enroot.
+
+### Common nv-sflow settings
+
+Run from `closed/NVIDIA`. Replace `ACCT`, `PARTITION`, and `SYSTEM` for your cluster and target system. The examples below use GB200x72.
+
+```bash
+ACCT=<your-slurm-account>
+PARTITION=gb200
+SYSTEM=GB200-NVL72_GB200-186GB_aarch64x72
+NODES=18
+SFLOW_DUMP_DIR=build/sbatch_scripts_sflow
+mkdir -p "$SFLOW_DUMP_DIR"
+```
+
+### Offline performance and accuracy
+
+```bash
+TEST_MODE=PerformanceOnly  # use AccuracyOnly for accuracy
+RUN=gpt_oss_120b_${SYSTEM}_offline_${TEST_MODE}_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/Offline/gptoss_config_sflow.yaml \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/Offline/slurm_env_sflow.yaml \
+  -f scaleout/sflow/templates/trtllm_ifb_loadgen.yaml \
+  --set WORK_DIR=$PWD \
+  --set TEST_MODE=$TEST_MODE \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+### Server performance and accuracy
+
+```bash
+TEST_MODE=PerformanceOnly  # use AccuracyOnly for accuracy
+RUN=gpt_oss_120b_${SYSTEM}_server_${TEST_MODE}_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/Server/gptoss_config_sflow.yaml \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/Server/slurm_env_sflow.yaml \
+  -f scaleout/sflow/templates/trtllm_ifb_loadgen.yaml \
+  --set WORK_DIR=$PWD \
+  --set TEST_MODE=$TEST_MODE \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+### Interactive performance and accuracy
+
+Interactive uses disaggregated serving with the `trtllm_disagg_loadgen.yaml` disagg loadgen template.
+
+```bash
+TEST_MODE=PerformanceOnly  # use AccuracyOnly for accuracy
+RUN=gpt_oss_120b_${SYSTEM}_interactive_${TEST_MODE}_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/Interactive/gptoss_config_sflow.yaml \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/Interactive/slurm_env_sflow.yaml \
+  -f scaleout/sflow/templates/trtllm_disagg_loadgen.yaml \
+  --set WORK_DIR=$PWD \
+  --set TEST_MODE=$TEST_MODE \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+### Multi-node compliance
+
+GPT-OSS-120B requires `TEST07` and `TEST09`; both must run in `PerformanceOnly` mode. Set `SCENARIO=Offline`, `Server`, or `Interactive`; use `trtllm_ifb_loadgen.yaml` for Offline/Server and `trtllm_disagg_loadgen.yaml` for Interactive.
+
+TEST07:
+
+```bash
+SCENARIO=Offline
+TEMPLATE=trtllm_ifb_loadgen.yaml
+# For Interactive, use:
+# SCENARIO=Interactive
+# TEMPLATE=trtllm_disagg_loadgen.yaml
+RUN=gpt_oss_120b_${SYSTEM}_${SCENARIO}_TEST07_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/${SCENARIO}/gptoss_config_sflow.yaml \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/${SCENARIO}/slurm_env_sflow.yaml \
+  -f scaleout/sflow/templates/$TEMPLATE \
+  --set WORK_DIR=$PWD \
+  --set TEST_MODE=PerformanceOnly \
+  --set HARNESS_EXTRA_ARGS="--audit_test=TEST07 --server_target_qps_adj_factor=0.92" \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+TEST09:
+
+```bash
+SCENARIO=Offline
+TEMPLATE=trtllm_ifb_loadgen.yaml
+# For Interactive, use:
+# SCENARIO=Interactive
+# TEMPLATE=trtllm_disagg_loadgen.yaml
+RUN=gpt_oss_120b_${SYSTEM}_${SCENARIO}_TEST09_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/${SCENARIO}/gptoss_config_sflow.yaml \
+  -f configs/gpt_oss_120b/${SYSTEM}/TRTLLM/${SCENARIO}/slurm_env_sflow.yaml \
+  -f scaleout/sflow/templates/$TEMPLATE \
+  --set WORK_DIR=$PWD \
+  --set TEST_MODE=PerformanceOnly \
+  --set HARNESS_EXTRA_ARGS="--audit_test=TEST09 --server_target_qps_adj_factor=0.92" \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+TEST07 has normal run-to-run variance. If it reports an accuracy score near but below the threshold, rerun it once before debugging the setup.
+
+## Benchmark Passing Criteria
+
+A run is valid only if the required accuracy and performance criteria pass. For
+Server and Interactive scenarios, both TTFT and TPOT latency must be within the
+threshold; reduce target QPS and rerun if either latency metric fails.
+
+
+| Scenario    | Accuracy criteria                       | Performance criteria       |
+| ----------- | --------------------------------------- | -------------------------- |
+| Offline     | `exact_match >= 83.13 * 0.99 = 82.2987` | No TTFT/TPOT constraint    |
+| Server      | `exact_match >= 83.13 * 0.99 = 82.2987` | TTFT <= 3 s; TPOT <= 80 ms |
+| Interactive | `exact_match >= 83.13 * 0.99 = 82.2987` | TTFT <= 2 s; TPOT <= 15 ms |
+
+

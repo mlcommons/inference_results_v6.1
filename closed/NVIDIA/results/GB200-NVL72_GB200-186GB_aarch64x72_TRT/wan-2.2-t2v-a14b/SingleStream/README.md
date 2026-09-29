@@ -1,0 +1,1 @@
+To run this benchmark, first follow the setup steps in closed/NVIDIA/README.md and the Wan2.2-T2V-A14B benchmark guide in closed/NVIDIA/src/nv_mlpinf/benchmarks/wan22_a14b/README.md. Then launch the Wan2.2 GB200-NVL72_GB200-186GB_aarch64x72_TRT SingleStream videogen endpoint workflow from closed/NVIDIA.
