@@ -1,0 +1,56 @@
+{
+    "TestScenario.SingleStream": {
+        "count": 404792,
+        "good_items": 0,
+        "mean": 0.0014028546290613545,
+        "percentiles": {
+            "50.0": 0.0014007091522216797,
+            "80.0": 0.0014050006866455078,
+            "90.0": 0.0014078617095947266,
+            "95.0": 0.0014104843139648438,
+            "99.0": 0.0014164447784423828,
+            "99.9": 0.002308012962341399
+        },
+        "qps": 673.3875747197554,
+        "took": 601.1278128623962,
+        "total_items": 404792
+    },
+    "args": {
+        "accuracy": false,
+        "audit_conf": "audit.config",
+        "backend": "onnxruntime",
+        "cache": 0,
+        "cache_dir": "/mnt/md0/madhav/MLC/repos/local/cache/get-preprocessed-dataset-imagenet_06ccb3f5",
+        "count": null,
+        "data_format": null,
+        "dataset": "imagenet",
+        "dataset_list": "/mnt/md0/madhav/MLC/repos/local/cache/extract-file_imagenet-aux-da_76c71a59/val.txt",
+        "dataset_path": "/mnt/md0/madhav/MLC/repos/local/cache/get-preprocessed-dataset-imagenet_06ccb3f5",
+        "debug": false,
+        "device": null,
+        "find_peak_performance": false,
+        "inputs": null,
+        "max_batchsize": 32,
+        "max_latency": null,
+        "model": "/mnt/md0/madhav/MLC/repos/local/cache/download-file_ml-model-resnet_d8b7b9ab/resnet50_v1.onnx",
+        "model_name": "resnet50",
+        "output": "/mnt/md0/madhav/MLC/repos/local/cache/get-mlperf-inference-results-dir_d5cd66d5/valid_results/r14_bm_03.houcbglr1.hpecorp.net-reference-gpu-onnxruntime-v1.28.0-cu133/resnet50/singlestream/performance/run_1",
+        "outputs": [
+            "ArgMax:0"
+        ],
+        "performance_sample_count": null,
+        "preprocessed_dir": null,
+        "profile": "resnet50-onnxruntime",
+        "qps": null,
+        "samples_per_query": 8,
+        "scenario": "SingleStream",
+        "threads": 2,
+        "time": null,
+        "use_preprocessed_dataset": true,
+        "user_conf": "/mnt/md0/madhav/MLC/repos/mlcommons@mlperf-automations/script/generate-mlperf-inference-user-conf/tmp/a2b940117c294be3a853abdd17389eec.conf"
+    },
+    "cmdline": "Namespace(dataset='imagenet', dataset_path='/mnt/md0/madhav/MLC/repos/local/cache/get-preprocessed-dataset-imagenet_06ccb3f5', dataset_list='/mnt/md0/madhav/MLC/repos/local/cache/extract-file_imagenet-aux-da_76c71a59/val.txt', data_format=None, profile='resnet50-onnxruntime', scenario='SingleStream', max_batchsize=32, model='/mnt/md0/madhav/MLC/repos/local/cache/download-file_ml-model-resnet_d8b7b9ab/resnet50_v1.onnx', output='/mnt/md0/madhav/MLC/repos/local/cache/get-mlperf-inference-results-dir_d5cd66d5/valid_results/r14_bm_03.houcbglr1.hpecorp.net-reference-gpu-onnxruntime-v1.28.0-cu133/resnet50/singlestream/performance/run_1', inputs=None, outputs=['ArgMax:0'], backend='onnxruntime', device=None, model_name='resnet50', threads=2, qps=None, cache=0, cache_dir='/mnt/md0/madhav/MLC/repos/local/cache/get-preprocessed-dataset-imagenet_06ccb3f5', preprocessed_dir=None, use_preprocessed_dataset=True, accuracy=False, find_peak_performance=False, debug=False, user_conf='/mnt/md0/madhav/MLC/repos/mlcommons@mlperf-automations/script/generate-mlperf-inference-user-conf/tmp/a2b940117c294be3a853abdd17389eec.conf', audit_conf='audit.config', time=None, count=None, performance_sample_count=None, max_latency=None, samples_per_query=8)",
+    "runtime": "onnxruntime",
+    "time": 1785520036,
+    "version": "1.28.0"
+}
