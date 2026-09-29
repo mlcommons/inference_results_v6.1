@@ -1,0 +1,336 @@
+# Qwen3-VL-235B-A22B
+
+## Support Matrix
+
+See [configs/SLURM_SUPPORT.md](../../../../../configs/SLURM_SUPPORT.md) for per-system, per-scenario SLURM support details.
+
+## Getting Started
+
+This directory contains the source code for NVIDIA's submission towards the
+[vision-language model (VLM) benchmark](https://github.com/mlcommons/inference/tree/master/multimodal/qwen3-vl)
+in the MLPerf Inference Benchmark Suite, starting from the v6.1 round.
+
+### Download Model (Optional)
+
+**Option 1 (Recommended): Rely on the sflow template for automatic download.**
+
+The sflow workflow includes a `prefetch_model` task that runs before any vLLM
+server starts. On the first run, pass a Hugging Face token so the template can
+download the model into the shared host cache:
+
+```bash
+sflow batch ... \
+  --set HF_CACHE_HOST_DIR=/path/to/hf_cache \
+  --set HF_TOKEN=$HF_TOKEN
+```
+
+For later runs, keep passing the same `HF_CACHE_HOST_DIR`; `hf download` reuses
+files already present in that cache.
+
+**Option 2: Download the model yourself.**
+
+```bash
+hf download nvidia/Qwen3-VL-235B-A22B-Instruct-NVFP4-MLPerf-Inference-Closed-V6.1-FP8-KV --revision main --cache-dir /path/to/hf_cache/hub --token <your hf token: hf_xxx>
+```
+
+After the manual download, pass the cache root, not the `hub` subdirectory, to
+sflow:
+
+```bash
+sflow batch ... \
+  --set HF_CACHE_HOST_DIR=/path/to/hf_cache
+```
+
+### Download and Prepare Data (Automatically downloaded)
+
+The Qwen3-VL-235B-A22B benchmark uses the same dataset for accuracy and performance runs. No manual transformations is needed before a benchmark run.
+The recommended way is to follow this guide to allow [Endpoints]((git@github.com:mlcommons/endpoints.git)) client to download the dataset and do all processing automatically.
+
+**Dataset Statistics:**
+
+
+| Dataset                      | Samples | Accuracy Target | Scenarios Applied |
+| ---------------------------- | ------- | --------------- | ----------------- |
+| Shopify-product-catalogue    | 48289   | 0.7824          | Offline, Server   |
+| Shopify-product-catalogue-8k | 8000    | 0.7799          | Interactive       |
+
+
+## Base Image
+
+Due to the server and SUT are now decoupled in v6.1 round via endpoints, two separate images are required to run the benchmark. Use the amd64 images for B200/B300 systems and the aarch64 images for GB200/GB300 systems.
+
+### Use pre-built docker image (Recommended)
+
+Internal users should use the images from NVIDIA GitLab:
+
+| System | Arch | Server image | Client image |
+| ------ | ---- | ------------ | ------------ |
+| B200-SXM-180GBx8, B300-SXM-270GBx8 | amd64 | `gitlab-master.nvidia.com:5005/mlpinf/mlperf-inference/mlperf-inf-mm-q3vl-nv:amd64_cuda13.0.1_CentML_dynamo-04a6e12_CentML_vllm-a65093c-gb300deps` | `ghcr.io/mlcommons/endpoints:bf9d12b105a833c1bfeb3365efce091b6bc93a15@sha256:738514ccbfa3aa71bfc89830f5b6bd2359de04045324c7a9fdb9843bae6f4582` |
+| GB200-NVL72, GB300-NVL72 (single node system or full rack system) | aarch64 | `gitlab-master.nvidia.com:5005/mlpinf/mlperf-inference/mlperf-inf-mm-q3vl-nv:arm64_cuda13.0.1_CentML_dynamo-cf42478_CentML_vllm-2395e34` | `ghcr.io/mlcommons/endpoints:bf9d12b105a833c1bfeb3365efce091b6bc93a15@sha256:3de494159acd2ab2b39042b0fb099590034c0d3a36b7540f90125a4a374da19d` |
+
+External users should use the images from the partner registry:
+
+| System | Arch | Server image                                                                                           | Client image |
+| ------ | ---- |--------------------------------------------------------------------------------------------------------| ------------ |
+| B200-SXM-180GBx8, B300-SXM-270GBx8 | amd64 | `registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/v6.1-jun26-q3vl-amd64:latest`   | `ghcr.io/mlcommons/endpoints:bf9d12b105a833c1bfeb3365efce091b6bc93a15@sha256:738514ccbfa3aa71bfc89830f5b6bd2359de04045324c7a9fdb9843bae6f4582` |
+| GB200-NVL72, GB300-NVL72 (single node system or full rack system) | aarch64 | `registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/v6.1-jul15-q3vl-aarch64:latest` | `ghcr.io/mlcommons/endpoints:bf9d12b105a833c1bfeb3365efce091b6bc93a15@sha256:3de494159acd2ab2b39042b0fb099590034c0d3a36b7540f90125a4a374da19d` |
+
+## Run the Benchmark in Multi Node using Slurm + Enroot
+
+This section covers Qwen3-VL SLURM runs through `nv-sflow`: backend container
+startup, endpoint client execution, model prefetch, performance, and accuracy.
+Run the examples from a SLURM cluster login node under `closed/NVIDIA`. If you
+are new to `nv-sflow`, first read [scaleout/sflow/README.md](../../../../../scaleout/sflow/README.md)
+for installation and the `sflow batch` / `sflow run` concepts.
+
+### Common nv-sflow settings
+
+Replace `ACCT`, `PARTITION`, `SYSTEM`, and `HF_CACHE_HOST_DIR` for your cluster
+and target system. The examples below use the full GB300x72 config.
+
+```bash
+ACCT=<your-slurm-account>
+PARTITION=<your-slurm-partition>
+SYSTEM=GB300-NVL72_GB300-288GB_aarch64x72
+NODES=18
+TIME=04:00:00
+SROOT=configs/qwen3_vl_235b_a22b
+SFLOW_DUMP_DIR=build/sbatch_scripts_sflow
+HF_CACHE_HOST_DIR=/path/to/hf_cache
+HF_TOKEN=hf_xxx  # recommended for the first model download
+mkdir -p "$SFLOW_DUMP_DIR"
+```
+
+### Offline Scenario performance and accuracy back to back run
+
+```bash
+RUN=q3vl_${SYSTEM}_offline_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f $SROOT/_shared/slurm_env.yaml \
+  -f $SROOT/_shared/templates/vllm_dynamo_serve_endpoints.yaml \
+  -f $SROOT/${SYSTEM}/VLLM/Offline/qwen3vl_config.yaml \
+  --set WORK_DIR=$PWD \
+  --set HF_CACHE_HOST_DIR=$HF_CACHE_HOST_DIR \
+  --set HF_TOKEN=$HF_TOKEN \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --set SLURM_TIME=$TIME \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  --time=$TIME \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+### Server Scenario performance and accuracy back to back run
+
+```bash
+RUN=q3vl_${SYSTEM}_server_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f $SROOT/_shared/slurm_env.yaml \
+  -f $SROOT/_shared/templates/vllm_dynamo_serve_endpoints.yaml \
+  -f $SROOT/${SYSTEM}/VLLM/Server/qwen3vl_config.yaml \
+  --set WORK_DIR=$PWD \
+  --set HF_CACHE_HOST_DIR=$HF_CACHE_HOST_DIR \
+  --set HF_TOKEN=$HF_TOKEN \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --set SLURM_TIME=$TIME \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  --time=$TIME \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+### Interactive Scenario performance and accuracy back to back run
+
+Interactive uses the 8k Shopify dataset and runs with P/D disaggregated setup, and the
+only tested and supported system for this disaggregated setup is GB300-NVL72_GB300-288GB_aarch64x72.
+
+```bash
+RUN=q3vl_${SYSTEM}_interactive_$(date +%Y%m%d-%H%M%S)
+
+sflow batch \
+  -f $SROOT/_shared/slurm_env.yaml \
+  -f $SROOT/_shared/templates/vllm_dynamo_pd_disagg_serve_endpoints.yaml \
+  -f $SROOT/GB300-NVL72_GB300-288GB_aarch64x72/VLLM/Interactive/qwen3vl_pd_disagg_config.yaml \
+  --set WORK_DIR=$PWD \
+  --set HF_CACHE_HOST_DIR=$HF_CACHE_HOST_DIR \
+  --set HF_TOKEN=$HF_TOKEN \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --set SLURM_TIME=$TIME \
+  --nodes=$NODES \
+  --partition=$PARTITION \
+  --account=$ACCT \
+  --time=$TIME \
+  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
+  --submit
+```
+
+### Debug mode: use nv-sflow Terminal UI mode (`sflow run`)
+
+Use `sflow run` for short debug runs when you want the live TUI instead of an
+asynchronous sbatch script. This example uses the single-node x4 Server config;
+use `sflow batch` for full-rack submissions.
+
+```bash
+DEBUG_SYSTEM=GB300-NVL72_GB300-288GB_aarch64x4
+RUN=q3vl_${DEBUG_SYSTEM}_server_debug_$(date +%Y%m%d-%H%M%S)
+OUT=scaleout/sflow_output/$RUN
+
+sflow run \
+  -f $SROOT/_shared/slurm_env.yaml \
+  -f $SROOT/_shared/templates/vllm_dynamo_serve_endpoints.yaml \
+  -f $SROOT/${DEBUG_SYSTEM}/VLLM/Server/qwen3vl_config.yaml \
+  --set WORK_DIR=$PWD \
+  --set HF_CACHE_HOST_DIR=$HF_CACHE_HOST_DIR \
+  --set HF_TOKEN=$HF_TOKEN \
+  --set SLURM_ACCOUNT=$ACCT \
+  --set SLURM_PARTITION=$PARTITION \
+  --set SLURM_TIME=$TIME \
+  --output-dir $OUT \
+  --tui
+```
+
+### Tip: scaled test runs before full rack
+
+For the full-rack x72 configs, `TOTAL_GPUS: 72` in `qwen3vl_config.yaml` means
+18 nodes with 4 GPUs per node. For a smaller test, copy or edit the scenario's
+`qwen3vl_config.yaml` and reduce `TOTAL_GPUS` to a smaller multiple of 4, then
+set `NODES=TOTAL_GPUS/4` in the `sflow batch` command.
+
+When scaling down, also reduce the load in the matching `endpoint.yaml`. For
+Server and Interactive, lower `settings.load_pattern.target_qps` roughly in
+proportion to the GPU count. For Offline, lower
+`settings.runtime.n_samples_to_issue: 869202` so the test does not issue the
+full-rack sample count. Once the smaller-scale run is stable, switch back to the
+full x72 config for a full-rack result.
+
+### Results
+
+- Per-task logs: `$OUT/{output_folder}/{sflow.log,<task>/...}`
+- Final QPS / Latency: `results/job_folder/results.json`
+- Loadgen percentiles (TTFT, TPOT, end-to-end latency):
+`results/qwen3_vl_235b_a22b_shopify_benchmark_offline_nvl4/report.txt`
+
+## Run the Benchmark in Single Node Using Docker
+
+This benchmark does not support launching components inside a docker container. We provide recipes to launch over slurm on either 1 nodes 4 GPUs, or up to 18 nodes 72 GPUs.
+
+## Benchmark Passing Criteria
+
+A run is valid only if the required accuracy and performance criteria pass.
+Qwen3-VL uses the inference endpoint client. That client records latency in the
+endpoint report, but it does not natively enforce the benchmark latency
+constraint. Check the reported p99 end-to-end latency before treating Server or
+Interactive results as valid. If latency is over the threshold, lower target QPS
+and rerun.
+
+
+| Scenario    | Dataset                      | Accuracy criteria                               | Performance criteria      |
+| ----------- | ---------------------------- | ----------------------------------------------- | ------------------------- |
+| Offline     | Shopify Product Catalogue    | `F1_HIERARCHICAL >= 0.7903 * 0.99 = 0.782397`   | No p99 latency constraint |
+| Server      | Shopify Product Catalogue    | `F1_HIERARCHICAL >= 0.7903 * 0.99 = 0.782397`   | End-to-end p99 <= 12 s    |
+| Interactive | Shopify Product Catalogue 8k | `F1_HIERARCHICAL >= 0.78777 * 0.99 = 0.7798923` | End-to-end p99 <= 1.5 s   |
+
+
+Following section is for **developers only** who are interested in build the docker images or generate their own quantized checkpoints.
+
+## Build the container image
+
+#### Via Docker
+
+You can leverage [scripts/build_image.sh](scripts/build_image.sh) to build a container
+image end-to-end for running this benchmark. At the
+[closed/NVIDIA/src/nv_mlpinf/benchmarks/q3vl/vllm](closed/NVIDIA/src/nv_mlpinf/benchmarks/q3vl/vllm)
+directory (i.e., where this `README.md` is), run the following command:
+
+```bash
+bash scripts/build_image.sh
+```
+
+#### Via enroot (no Docker daemon required)
+
+[scripts/build_image_enroot.sh](scripts/build_image_enroot.sh) builds the same container
+image using enroot directly on SLURM compute nodes. All sources (vllm, dynamo, mlperf
+packages) are cloned from git inside the container.
+
+**Basic usage** (from the project directory):
+
+```bash
+# Run directly on a compute node
+bash scripts/build_image_enroot.sh \
+    --dynamo-revision 04a6e12 \
+    --vllm-revision a65093c
+
+# Or submit via SLURM
+sbatch --account=<account> --partition=<partition> -N1 --time=04:00:00 --mem=0 \
+    --output=./output/slurm_%j/stdout --error=./output/slurm_%j/stderr \
+    scripts/build_image_enroot.sh \
+        --dynamo-revision 04a6e12 \
+        --vllm-revision a65093c
+```
+
+**Caching the vllm build** (vllm compilation takes ~1.5 hours):
+
+```bash
+# First build: compile vllm and cache the intermediate image
+bash scripts/build_image_enroot.sh \
+        --dynamo-revision 04a6e12 \
+        --vllm-revision a65093c \
+        --cache-vllm-base
+
+# Subsequent builds: reuse the cached vllm image (~5 min)
+bash scripts/build_image_enroot.sh \
+    --dynamo-revision 04a6e12 \
+    --vllm-revision a65093c \
+    --vllm-base-sqsh build/cache/vllm-CentML_vllm-mlperf-inf-mm-q3vl-v6.0-cuda13.0.1-arm64.sqsh
+```
+
+**Output**: a `.sqsh` file in `build/` (override with `--sqsh-output-dir`).
+The CUDA base image is cached in `build/cache/` and reused across builds.
+
+Run `bash scripts/build_image_enroot.sh --help` for all available options.
+
+If you would like to run the benchmark on a `amd64` (i.e., x86) system, you would need
+to build the image on an `amd64` (i.e., x86) system. Conversely, you would need to build
+the image on an `arm64` (i.e., `aarch64`) system for running the benchmark on a `arm64`
+(i.e., `aarch64`) system.
+
+Building the vLLM base image can be intensive on CPU and host memory resources. We
+recommend to build the image on a machine with at least 72 CPU threads and 574 GB of
+host memory.
+
+
+
+
+
+
+### NVFP4 + FP8-KV Quantization with TensorRT-Model-Optimizer
+
+> [!NOTE]
+> We quantized the model to NVFP4 (W4A4) with a calibrated per-tensor FP8 KV cache and uploaded it to
+> [nvidia/Qwen3-VL-235B-A22B-Instruct-NVFP4-MLPerf-Inference-Closed-V6.1-FP8-KV](https://huggingface.co/nvidia/Qwen3-VL-235B-A22B-Instruct-NVFP4-MLPerf-Inference-Closed-V6.1-FP8-KV)
+> (served from the repo `main`).
+> Please use this provided checkpoint if you don't have a specific need to calibrate one yourself.
+> All benchmarking configs use it by default (`MODEL_REPO_ID` in each
+> `configs/qwen3_vl_235b_a22b/.../qwen3vl_config.yaml`).
+
+The checkpoint is produced with [NVIDIA TensorRT-Model-Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer):
+NVFP4 on every linear layer (static MSE weight scales plus dynamic NVFP4 inputs) with a calibrated
+per-tensor FP8 KV cache. Adding the FP8 KV cache and recovering accuracy with MSE weight calibration
+matches the FP16-KV NVFP4-only baseline within noise at higher throughput.
+
+We calibrate on the **Shopify** dataset (the benchmark's own data) to comply with the MLPerf calibration
+rules.
+
+To reproduce the checkpoint, see [scripts/quantization/README.md](scripts/quantization/README.md): one
+command (`scripts/quantization/quantize_qwen3vl_nvfp4_fp8kv.py`) that builds the Shopify calibration, runs
+the ModelOpt PTQ, and writes a vLLM-loadable export. The quantization runs in a dedicated ModelOpt
+environment and does not require the vLLM base or submission container.

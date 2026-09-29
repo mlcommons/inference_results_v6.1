@@ -1,0 +1,1 @@
+To run this benchmark, first follow the setup steps in closed/GigaComputing/README.md and the Wan2.2-T2V-A14B benchmark guide in closed/GigaComputing/src/nv_mlpinf/benchmarks/wan22_a14b/README.md. Then launch the Wan2.2 G894-ZD3-AAX7_B300-SXM-270GBx8 SingleStream videogen endpoint workflow from closed/GigaComputing.
