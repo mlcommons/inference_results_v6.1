@@ -1,0 +1,78 @@
+name: online-qwen3-vl-235b-a22b-shopify-benchmark
+version: '1.0'
+type: online
+submission_ref:
+  model: qwen3-vl-235b-a22b
+  ruleset: mlperf-inference-v6.1
+model_params:
+  name: nvidia/Qwen3-VL-235B-A22B-Instruct-NVFP4-MLPerf-Inference-Closed-V6.1-FP8-KV
+  max_new_tokens: 150
+  min_new_tokens: 1
+  skip_special_tokens: true
+  streaming: 'on'
+datasets:
+- name: shopify_product_catalogue::q3vl
+  type: performance
+- name: shopify_product_catalogue::q3vl
+  type: accuracy
+  accuracy_config:
+    eval_method: shopify_category_f1
+    ground_truth: ground_truth_category
+    extractor: identity_extractor
+    num_repeats: 1
+settings:
+  runtime:
+    min_duration_ms: 600000
+    max_duration_ms: 0
+    scheduler_random_seed: 16159082839903944936
+    dataloader_random_seed: 2747215439041700203
+  load_pattern:
+    type: poisson
+    target_qps: 2340.0
+    use_legacy_loadgen_qps_metrics: true
+  client:
+    num_workers: 8
+    log_level: INFO
+    warmup_connections: -1
+    auto_warmup_budget_fraction: 0.25
+    max_concurrent_warmup_connects: 128
+    max_connections: 16384
+    transport:
+      type: zmq
+      recv_buffer_size: 16777216
+      send_buffer_size: 16777216
+      io_threads: 4
+      worker_io_threads: 1
+      high_water_mark: 0
+      linger: -1
+      immediate: 1
+    stream_all_chunks: false
+    worker_initialization_timeout: 120.0
+    worker_graceful_shutdown_wait: 0.5
+    worker_force_kill_timeout: 0.5
+    insecure: false
+    max_idle_time: 4.0
+    min_required_connections: -1
+    worker_gc_mode: relaxed
+  drain:
+    warmup_timeout_s: 240.0
+    metrics_drain_timeout_s: 0.0
+    metrics_tokenizer_workers: 2
+  warmup:
+    enabled: true
+    n_requests: 7200
+    salt: true
+    drain: true
+    warmup_random_seed: 2747215439041700203
+  profiling: {}
+  early_stopping:
+    enabled: true
+  service_ready_timeout_s: 30.0
+endpoint_config:
+  endpoints:
+  - http://127.0.0.1:8000
+  api_type: openai
+report_dir: log_collection/result_collection/hecate/VR200/20260730-172002/qps_sweep/x72_server/confirmation/attempt_0_qps_2340_pinned_sflow_20260731-104457
+timeout: 14400.0
+verbose: false
+enable_cpu_affinity: true

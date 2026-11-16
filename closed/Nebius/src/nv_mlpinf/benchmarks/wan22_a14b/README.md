@@ -23,12 +23,6 @@ cd closed/NVIDIA
 WORK_DIR=$PWD
 SCRATCH_DIR=/lustre/share/coreai_mlperf_inference/mlperf_inference_storage_clone  # shared storage visible to all nodes
 SFLOW_VENV=/lustre/fsw/coreai_mlperf_inference/$USER/.venv-sflow
-
-# x86_64 only (B300-SXM-270GBx8, B200-SXM-180GBx8):
-# Path to a static Linux x86_64 ffmpeg binary. The x86 server image encodes
-# videos as H.264 mp4 only when ffmpeg is present; without it the AVI fallback
-# breaks VBench scoring. Download a static build once and point FFMPEG_BIN at it.
-FFMPEG_BIN=/path/to/static/ffmpeg
 ```
 
 ### Set up sflow (one-time, on the SLURM login node)
@@ -40,7 +34,7 @@ installed. Create it once and reuse it. New to nv-sflow? See
 ```bash
 # From closed/NVIDIA (uv: https://docs.astral.sh/uv/getting-started/installation/)
 uv venv
-uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
+uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@6efbf59c4a835473b08362eb623358e3ace31d6e"
 source .venv/bin/activate
 ```
 
@@ -74,13 +68,13 @@ src/nv_mlpinf/benchmarks/wan22_a14b/scripts/prepare_vbench_cache.sh   # -> build
 ### Step 2 - Pull the images
 
 Pre-built images are wired into `configs/wan22_a14b/_shared/slurm_env.yaml` as
-the defaults. The x86_64 server image must be set via `--set CONTAINER_IMAGE=...`
-(see the examples below).
+the defaults, which target aarch64. An x86_64 run overrides the server image with
+`--set CONTAINER_IMAGE=...`.
 
 | Image | Tag |
 |-------|-----|
-| Server (aarch64) | `registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jun26-wan22-trtllm-aarch64` |
-| Server (x86_64) | `registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul10-wan22-trtllm-x86_64` |
+| Server (aarch64) | `registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul25-wan22-trtllm-aarch64` |
+| Server (x86_64) | `registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul24-wan22-trtllm-x86_64` |
 | Client (all arches) | `ghcr.io/mlcommons/endpoints:598dbfde68ebfa42256762ebb60fd4da227b813c-vbench` |
 
 Pyxis/enroot pulls `docker://` registry URLs directly. For the private GitLab
@@ -141,6 +135,44 @@ sbatch build/sbatch_scripts_sflow/wan22_gb300x72_ss_acc.sh
 </details>
 
 <details>
+<summary>GB200-NVL72 x72 (18 nodes, Offline) - aarch64</summary>
+
+```bash
+source $SFLOW_VENV/bin/activate
+sflow batch \
+  -f configs/wan22_a14b/_shared/slurm_env.yaml \
+  -f configs/wan22_a14b/GB200-NVL72_GB200-186GB_aarch64x72/visual_gen/Offline/wan22_config.yaml \
+  -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_submission.yaml \
+  --set WORK_DIR=$WORK_DIR \
+  --set SCRATCH_DIR=$SCRATCH_DIR \
+  --set NUM_SERVERS=72 \
+  --nodes=18 --partition=gb200 --account=coreai_mlperf_inference --time=05:00:00 \
+  --job-name=wan22-gb200x72-offline-acc \
+  -o build/sbatch_scripts_sflow/wan22_gb200x72_offline_acc.sh
+deactivate
+sbatch build/sbatch_scripts_sflow/wan22_gb200x72_offline_acc.sh
+```
+</details>
+<details>
+<summary>GB200-NVL72 x72 (18 nodes, SingleStream) - aarch64</summary>
+
+```bash
+source $SFLOW_VENV/bin/activate
+sflow batch \
+  -f configs/wan22_a14b/_shared/slurm_env.yaml \
+  -f configs/wan22_a14b/GB200-NVL72_GB200-186GB_aarch64x72/visual_gen/SingleStream/wan22_config.yaml \
+  -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_submission.yaml \
+  --set WORK_DIR=$WORK_DIR \
+  --set SCRATCH_DIR=$SCRATCH_DIR \
+  --set NUM_SERVERS=1 \
+  --nodes=18 --partition=gb200 --account=coreai_mlperf_inference --time=05:00:00 \
+  --job-name=wan22-gb200x72-ss-acc \
+  -o build/sbatch_scripts_sflow/wan22_gb200x72_ss_acc.sh
+deactivate
+sbatch build/sbatch_scripts_sflow/wan22_gb200x72_ss_acc.sh
+```
+</details>
+<details>
 <summary><code>B300-SXM-270GBx8</code> (1 node, Offline) - x86_64</summary>
 
 ```bash
@@ -151,8 +183,7 @@ sflow batch \
   -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_submission.yaml \
   --set WORK_DIR=$WORK_DIR \
   --set SCRATCH_DIR=$SCRATCH_DIR \
-  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul10-wan22-trtllm-x86_64" \
-  "--set CONTAINER_MOUNTS=$WORK_DIR:/work,$SCRATCH_DIR:/home/mlperf_inference_storage,$WORK_DIR/ci/scripts/smoke_test/patches/videogen_adapter.py:/opt/venv/lib/python3.12/site-packages/inference_endpoint/videogen/adapter.py,$WORK_DIR/ci/scripts/smoke_test/patches/visual_gen_executor.py:/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/visual_gen/executor.py,$FFMPEG_BIN:/usr/local/bin/ffmpeg" \
+  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul24-wan22-trtllm-x86_64" \
   --nodes=1 --partition=batch --account=coreai_mlperf_inference --time=05:00:00 \
   --job-name=wan22-b300x8-offline-acc \
   -o build/sbatch_scripts_sflow/wan22_b300x8_offline_acc.sh
@@ -160,7 +191,6 @@ deactivate
 sbatch build/sbatch_scripts_sflow/wan22_b300x8_offline_acc.sh
 ```
 </details>
-
 <details>
 <summary><code>B300-SXM-270GBx8</code> (1 node, SingleStream) - x86_64</summary>
 
@@ -172,8 +202,7 @@ sflow batch \
   -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_submission.yaml \
   --set WORK_DIR=$WORK_DIR \
   --set SCRATCH_DIR=$SCRATCH_DIR \
-  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul10-wan22-trtllm-x86_64" \
-  "--set CONTAINER_MOUNTS=$WORK_DIR:/work,$SCRATCH_DIR:/home/mlperf_inference_storage,$WORK_DIR/ci/scripts/smoke_test/patches/videogen_adapter.py:/opt/venv/lib/python3.12/site-packages/inference_endpoint/videogen/adapter.py,$WORK_DIR/ci/scripts/smoke_test/patches/visual_gen_executor.py:/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/visual_gen/executor.py,$FFMPEG_BIN:/usr/local/bin/ffmpeg" \
+  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul24-wan22-trtllm-x86_64" \
   --nodes=1 --partition=batch --account=coreai_mlperf_inference --time=05:00:00 \
   --job-name=wan22-b300x8-ss-acc \
   -o build/sbatch_scripts_sflow/wan22_b300x8_ss_acc.sh
@@ -181,7 +210,6 @@ deactivate
 sbatch build/sbatch_scripts_sflow/wan22_b300x8_ss_acc.sh
 ```
 </details>
-
 > **GPU count:** an x72 run uses exactly **72 GPUs (18 nodes)**, all servers
 > (Offline: 72 single-GPU replicas; SS: 1 replica across 72). The VBench scorer is
 > **not** a 73rd GPU: the endpoint task requests no `resources.gpus` and
@@ -202,8 +230,12 @@ does no VBench scoring, so it needs no scorer GPU or weight cache.
 
 The endpoint client runs TEST04 natively: a reference phase (distinct prompts)
 followed by a fixed-sample phase (one prompt repeated), then writes
-`audit/audit_result.json` and `verify_OUTPUT_CACHING_TEST.txt`.
-Valid iff `audit_qps < ref_qps × (1 + threshold)`.
+`audit/audit_output_caching_test.json` and `verify_OUTPUT_CACHING_TEST.txt` under
+the run's `endpoint_benchmark/`. Valid iff `audit_qps < ref_qps × (1 + threshold)`.
+
+For packaging (Step 4) the checker reads `audit/audit_output_caching_test.json`
+(schema `{"test":"output_caching_test","passed":true}`), which the audit run
+emits directly, so staging is a plain copy (no conversion).
 
 <details>
 <summary>GB300-NVL72 x72 (18 nodes, Offline) - aarch64</summary>
@@ -248,6 +280,46 @@ sbatch build/sbatch_scripts_sflow/wan22_gb300x72_ss_test04.sh
 </details>
 
 <details>
+<summary>GB200-NVL72 x72 (18 nodes, Offline) - aarch64</summary>
+
+```bash
+source $SFLOW_VENV/bin/activate
+sflow batch \
+  -f configs/wan22_a14b/_shared/slurm_env.yaml \
+  -f configs/wan22_a14b/GB200-NVL72_GB200-186GB_aarch64x72/visual_gen/Offline/wan22_config.yaml \
+  -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_no_vbench.yaml \
+  --set WORK_DIR=$WORK_DIR \
+  --set SCRATCH_DIR=$SCRATCH_DIR \
+  --set NUM_SERVERS=72 \
+  --set ENDPOINT_CONFIG=configs/wan22_a14b/_shared/endpoint_audit_test04_offline_x72.yaml \
+  --nodes=18 --partition=gb200 --account=coreai_mlperf_inference --time=05:00:00 \
+  --job-name=wan22-gb200x72-offline-test04 \
+  -o build/sbatch_scripts_sflow/wan22_gb200x72_offline_test04.sh
+deactivate
+sbatch build/sbatch_scripts_sflow/wan22_gb200x72_offline_test04.sh
+```
+</details>
+<details>
+<summary>GB200-NVL72 x72 (18 nodes, SingleStream) - aarch64</summary>
+
+```bash
+source $SFLOW_VENV/bin/activate
+sflow batch \
+  -f configs/wan22_a14b/_shared/slurm_env.yaml \
+  -f configs/wan22_a14b/GB200-NVL72_GB200-186GB_aarch64x72/visual_gen/SingleStream/wan22_config.yaml \
+  -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_no_vbench.yaml \
+  --set WORK_DIR=$WORK_DIR \
+  --set SCRATCH_DIR=$SCRATCH_DIR \
+  --set NUM_SERVERS=1 \
+  --set ENDPOINT_CONFIG=configs/wan22_a14b/_shared/endpoint_audit_test04_singlestream.yaml \
+  --nodes=18 --partition=gb200 --account=coreai_mlperf_inference --time=05:00:00 \
+  --job-name=wan22-gb200x72-ss-test04 \
+  -o build/sbatch_scripts_sflow/wan22_gb200x72_ss_test04.sh
+deactivate
+sbatch build/sbatch_scripts_sflow/wan22_gb200x72_ss_test04.sh
+```
+</details>
+<details>
 <summary><code>B300-SXM-270GBx8</code> (1 node, Offline) - x86_64</summary>
 
 ```bash
@@ -258,9 +330,8 @@ sflow batch \
   -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_no_vbench.yaml \
   --set WORK_DIR=$WORK_DIR \
   --set SCRATCH_DIR=$SCRATCH_DIR \
-  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul10-wan22-trtllm-x86_64" \
+  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul24-wan22-trtllm-x86_64" \
   --set ENDPOINT_CONFIG=configs/wan22_a14b/_shared/endpoint_audit_test04_offline_x8.yaml \
-  "--set CONTAINER_MOUNTS=$WORK_DIR:/work,$SCRATCH_DIR:/home/mlperf_inference_storage,$WORK_DIR/ci/scripts/smoke_test/patches/videogen_adapter.py:/opt/venv/lib/python3.12/site-packages/inference_endpoint/videogen/adapter.py,$WORK_DIR/ci/scripts/smoke_test/patches/visual_gen_executor.py:/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/visual_gen/executor.py,$FFMPEG_BIN:/usr/local/bin/ffmpeg" \
   --nodes=1 --partition=batch --account=coreai_mlperf_inference --time=05:00:00 \
   --job-name=wan22-b300x8-offline-test04 \
   -o build/sbatch_scripts_sflow/wan22_b300x8_offline_test04.sh
@@ -268,7 +339,6 @@ deactivate
 sbatch build/sbatch_scripts_sflow/wan22_b300x8_offline_test04.sh
 ```
 </details>
-
 <details>
 <summary><code>B300-SXM-270GBx8</code> (1 node, SingleStream) - x86_64</summary>
 
@@ -280,9 +350,8 @@ sflow batch \
   -f configs/wan22_a14b/_shared/templates/wan22_videogen_endpoints_no_vbench.yaml \
   --set WORK_DIR=$WORK_DIR \
   --set SCRATCH_DIR=$SCRATCH_DIR \
-  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul10-wan22-trtllm-x86_64" \
+  --set CONTAINER_IMAGE="docker://registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/wan22-trtllm-server:v6.1-jul24-wan22-trtllm-x86_64" \
   --set ENDPOINT_CONFIG=configs/wan22_a14b/_shared/endpoint_audit_test04_singlestream.yaml \
-  "--set CONTAINER_MOUNTS=$WORK_DIR:/work,$SCRATCH_DIR:/home/mlperf_inference_storage,$WORK_DIR/ci/scripts/smoke_test/patches/videogen_adapter.py:/opt/venv/lib/python3.12/site-packages/inference_endpoint/videogen/adapter.py,$WORK_DIR/ci/scripts/smoke_test/patches/visual_gen_executor.py:/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/visual_gen/executor.py,$FFMPEG_BIN:/usr/local/bin/ffmpeg" \
   --nodes=1 --partition=batch --account=coreai_mlperf_inference --time=05:00:00 \
   --job-name=wan22-b300x8-ss-test04 \
   -o build/sbatch_scripts_sflow/wan22_b300x8_ss_test04.sh
@@ -290,7 +359,6 @@ deactivate
 sbatch build/sbatch_scripts_sflow/wan22_b300x8_ss_test04.sh
 ```
 </details>
-
 Validated TEST04 configs and pass results:
 
 | System | Scenario | Samples | Threshold | Result |
@@ -299,6 +367,12 @@ Validated TEST04 configs and pass results:
 | GB300-NVL72 x72 | SingleStream | 50/50 | 0.20 | PASS |
 | `B300-SXM-270GBx8` | Offline | 144/144 | 0.10 | PASS |
 | `B300-SXM-270GBx8` | SingleStream | 50/50 | 0.20 | PASS |
+
+> **x86_64 note.** The aarch64 pin carries a `visual_gen.py` patch so `MASTER_PORT` is
+> honoured for single-process (Offline) replicas; without it the server picks a random
+> free port and packed replicas can collide on startup. That patch is **not** in the
+> x86_64 image, and B300x8 Offline packs 8 replicas on one node, so that is the case to
+> watch. Both images ship ffmpeg, so videos are MP4 on either arch.
 
 #### Performance only run (no VBench) (optional)
 
@@ -325,40 +399,141 @@ sbatch build/sbatch_scripts_sflow/wan22_gb300x4_offline_perf.sh
 ### Step 4 - Submission packaging
 
 wan22 is **endpoint-based**, so the `submission_checker` reads the endpoint
-result files (`result_summary.json`, `results.json`, `config.yaml`) through its
-`endpoints_parser`, **not** the LoadGen `mlperf_log_*` files. `wan-2.2-t2v-a14b`
-is in the checker's `ENDPOINTS_ALLOWED_MODELS`; it validates endpoint
-performance and accuracy (endpoint compliance is currently stubbed upstream, but
-the TEST04 files are still required by the rules).
+result files through its `EndpointsParser`, **not** the LoadGen `mlperf_log_*`
+files. `wan-2.2-t2v-a14b` is in the checker's `ENDPOINTS_ALLOWED_MODELS`; it
+validates endpoint performance, accuracy, and TEST04 compliance. The exact paths
+the parser reads (verified against the `mlc-inference` submodule checker):
+`<scenario>/config.yaml`, `<scenario>/performance/result_summary.json`,
+`<scenario>/accuracy/accuracy_results.json`, and
+`<scenario>/audit/audit_output_caching_test.json`.
 
-For each system and scenario (`<scenario>` = `Offline` or `SingleStream`), build
-this tree, staging each run's files from its `endpoints_report/` output:
+#### Recommended: `prepare_submission.sh`
+
+`scripts/prepare_submission.sh` assembles the submission folder for one
+system+scenario from an accuracy run and a TEST04 audit run: it copies the run
+output, stages the 10 human-audit videos, prunes
+run-only artifacts the reference omits, and writes `measurements.json`
+(`input_data_types` = `bf16`) plus `README.md`. Run once per scenario
+(`Offline`, `SingleStream`).
+
+```bash
+# from closed/NVIDIA (the aarch64 server image emits MP4 natively)
+git submodule update --init 3rdparty/mlc-inference   # provides samples_filename_ids.txt
+src/nv_mlpinf/benchmarks/wan22_a14b/scripts/prepare_submission.sh \
+    --system GB300-NVL72_GB300-288GB_aarch64x72 \
+    --scenario Offline \
+    --acc-run   <Step 3 Command 1 output>/endpoint_benchmark \
+    --audit-run <Step 3 Command 2 output>/endpoint_benchmark \
+    --out build/submission \
+    --videos-dir results/wan22-a14b/videos/<job-id>   # host runs; see the videos subsection
+```
+
+Pass `--measurements <file>` to supply your own `measurements.json`, or
+`--run-checker` to run the checker right after staging. The submission root also
+needs `closed/NVIDIA/systems/<SYSTEM>.json` and a `closed/NVIDIA/src/` directory
+(standard NVIDIA submission artifacts, not wan22-specific).
+
+Run the checker from the `mlc-inference` submodule (`wan-2.2-t2v-a14b` is a v6.1
+benchmark):
+
+```bash
+# from closed/NVIDIA; resolve the submission root to an absolute path before cd
+SUB=$(realpath build/submission)
+cd 3rdparty/mlc-inference/tools/submission
+python3 -m submission_checker.main \
+    --input "$SUB" \
+    --version v6.1 \
+    --submitter NVIDIA \
+    --skip-power-check
+```
+
+A clean run prints one line per result and writes `summary.csv`; a non-zero exit
+or any `ERROR` line means a path or metric is off (this endpoint layout comes from
+the `mlc-inference` "Update endpoints structure" change, so keep the submodule
+current).
+
+#### Submission tree (what `prepare_submission.sh` builds)
+
+For each system and scenario (`<scenario>` = `Offline` or `SingleStream`), the tree
+(matching the `Test_Dummy_System` reference submission), staged from each run's
+`endpoint_benchmark/` output:
 
 ```
 results/<system>/wan-2.2-t2v-a14b/<scenario>/
-  performance/run_1/
-      result_summary.json          # perf metric (QPS / per-query latency)
-      results.json
-      config.yaml
+  config.yaml                      # scenario root (checker reads this)
+  measurements.json                # required, IN the scenario dir (not a separate tree)
+  README.md                        # required
+  report.txt                       # run report
+  performance/
+      result_summary.json          # perf metric; no run_1 subdir
+  metrics/
+      final_snapshot.json
   accuracy/
-      result_summary.json
-      results.json                 # holds accuracy_scores.vbench_score (threshold 69.7752)
-      config.yaml
-      videos/                      # required: the specific sample video IDs the checker lists
-  compliance/TEST04/
-      audit_result.json            # from Command 2
-      verify_OUTPUT_CACHING_TEST.txt   # "Performance check pass: True"
-measurements/<system>/wan-2.2-t2v-a14b/<scenario>/
-      measurements.json            # required
-      README.md                    # required
-      mlperf.conf                  # recommended (seed reference)
-                                   # user.conf is NOT required for endpoint submissions
+      accuracy_results.json        # accuracy_scores[].score + total_samples (threshold 69.7752)
+      videos/                      # required: exactly the 10 sample <id>.mp4 + captions.txt
+  vbench_results/
+      vbench_wan22_vbench_eval_results.json
+      vbench_wan22_vbench_full_info.json
+  audit/                           # TEST04, from the audit run
+      audit_output_caching_test.json   # {"test":"output_caching_test","passed":true}
+      verify_OUTPUT_CACHING_TEST.txt
+      output_caching/              # config.yaml, report.txt, metrics/, performance/result_summary.json
+      reference/                   # config.yaml, report.txt, metrics/, performance/result_summary.json
 ```
 
+The parser reads metrics from only `config.yaml`, `performance/result_summary.json`,
+`accuracy/accuracy_results.json`, and `audit/audit_output_caching_test.json`. The
+checker also enforces (not optional) that `accuracy/videos/` holds the **10 specific
+sample `<id>.mp4` files plus `captions.txt`** listed in `REQUIRED_ACC_BENCHMARK` for
+the version (the official IDs in mlc-inference
+[`samples_filename_ids.txt`](https://github.com/mlcommons/inference/blob/c998c0e72f32de797c03101d482ddc30ac51f8ba/text_to_video/wan-2.2-t2v-a14b/data/samples_filename_ids.txt)),
+and a valid `measurements.json`.
+`prepare_submission.sh` writes exactly those 10 (from the submodule's
+`samples_filename_ids.txt`). The remaining files are the run's own output, included to
+match the reference submission.
+
 > Notes:
-> - wan22 requires **TEST04** (output-caching) only, not TEST06/TEST07/TEST09.
+> - `measurements.json` and `README.md` go **in the scenario dir** (next to
+>   `config.yaml`), not in a separate `measurements/<system>/…` tree. wan22 endpoint
+>   submissions have no `mlperf.conf` / `user.conf`.
+> - The endpoints parser reads `config.yaml` at the **scenario root** (not inside
+>   `performance/` or `accuracy/`), `performance/result_summary.json` with **no
+>   `run_1`** subdir, and the accuracy metrics from `accuracy/accuracy_results.json`
+>   (not `results.json`).
+> - wan22 requires **TEST04** (output-caching) only, not TEST06/TEST07/TEST09. The
+>   checker reads `audit/audit_output_caching_test.json`; the audit run also emits
+>   `verify_OUTPUT_CACHING_TEST.txt` and the `output_caching/` + `reference/` subdirs,
+>   included in the submission per the reference.
 > - There is no `truncate_accuracy_log.py` step: that truncates the LoadGen
 >   `mlperf_log_accuracy.json`, which endpoint runs do not produce.
+
+#### Human-audit sample videos (`accuracy/videos/`)
+
+The submission must include a fixed subset of generated clips, named by the
+official MLCommons sample IDs, so a human auditor can compare each prompt to its
+video. The subset and target filenames are defined upstream in
+`text_to_video/wan-2.2-t2v-a14b/data/samples_filename_ids.txt` (shipped in the
+`mlc-inference` submodule), one mapping per line: `<prompt>-0.mp4, <id>.mp4`.
+
+`prepare_submission.sh` stages them from the accuracy run's `vbench_videos/` dir
+(which symlinks `<prompt>-0.mp4` to that prompt's generated clip), copying each
+required clip under its official `<id>.mp4` name and writing `captions.txt`. It
+fails if any required sample is missing, or if a source is not MP4: the aarch64
+server image bakes in ffmpeg and emits MP4 directly, so an AVI means the run used
+an older image and has to be redone.
+
+> On the host the `vbench_videos/` symlinks point at the in-container `/work/...`
+> path, so pass `--videos-dir` (the raw video dir) to resolve them by basename.
+> Omit it only when the symlinks resolve directly (e.g. run in-container).
+>
+> Each run writes to its own `results/wan22-a14b/videos/$SLURM_JOB_ID/`, so point
+> `--videos-dir` at **that run's** job-id dir, not the parent. `readlink` the
+> symlink to read the id straight off the run:
+>
+> ```bash
+> readlink "<acc-run>/endpoint_benchmark/vbench_videos/"*-0.mp4 | head -1
+> # /work/results/wan22-a14b/videos/<job-id>/video_<uuid>_0.mp4
+> ```
 
 ## Support Matrix
 
@@ -478,16 +653,6 @@ python examples/diffusers/quantization/quantize_dp.py \
 # done; wait
 ```
 
-Gotchas (learned the hard way on GB200/GB300):
-
-- **Do not pass `--collect-method` for FP8.** Omit it entirely; `--format fp8 --quantize-mha` is the correct FP8 invocation.
-- **`--calib-size` must be divisible by `WORLD_SIZE`.** Otherwise ranks get uneven batch
-  counts and the straggler makes the amax all-reduce exceed NCCL's default 600 s timeout
-  (a single Wan 2.2 calibration batch is ~10 min). Use a divisible `calib-size`, or raise
-  the process-group timeout in `quantize_dp.py`.
-- **Runtime is ~4.5 h on 4× GB200.** Use a **non-preemptible** partition - a preempted
-  run loses everything (checkpoints are only written between the two backbones).
-
 Then point the harness at the generated `hf/` directory with `--set MODEL_PATH=...`
 (symlink it under `SCRATCH_DIR` so every node can reach it).
 
@@ -552,3 +717,18 @@ so the bake compiles it from source with Rust - build on the matching partition
 - Operators use sflow's native `container_image` field (no
   `container_name`/`extra_args`) so each replica gets its own per-task container
   (no enroot name collision when packing replicas per node).
+
+## FAQ
+
+**Q: My generated videos are `.avi`, but the submission needs `.mp4`. How do I fix it?**
+
+Re-run with a server image that has `ffmpeg` on `PATH`. The encoder resolves it with
+a plain `shutil.which("ffmpeg")` inside the server container and reads no env var, so
+a host-side path or bind-mount does nothing unless it lands on the container `PATH`.
+With ffmpeg it writes H.264 `.mp4`; without it, a pure-Python MJPEG `.avi`. The
+aarch64 `v6.1-jul25` image ships ffmpeg at `/usr/local/bin`, so those runs are `.mp4`
+from the start.
+
+Renaming `.avi` to `.mp4` does not convert it - the container is still MJPEG, and a
+human auditor gets an unplayable file. `prepare_submission.sh` therefore refuses to
+stage a non-mp4 source rather than emit a submission that fails audit.

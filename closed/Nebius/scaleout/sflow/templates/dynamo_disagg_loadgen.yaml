@@ -1,0 +1,548 @@
+version: "0.1"
+
+# Dynamo + TRT-LLM disaggregated (prefill/decode split) workflow with MLPerf
+# loadgen client.
+#
+# Launch model mirrors trtllm_disagg_loadgen.yaml: every process is started
+# DIRECTLY from this template. There is no nv_mlpinf wrapper layer — no
+# `--action=run_llm_server`, and no per-role `server.py` config stubs.
+#
+# Differences vs trtllm_disagg_loadgen.yaml (see DYNAMO NOTES for the
+# flag-by-flag delta):
+#   - workers run `trtllm-llmapi-launch python3 -m dynamo.trtllm` instead of
+#     `trtllm-serve`. Workers do NOT listen on an HTTP port; they register with
+#     the frontend over NATS/etcd.
+#   - the frontend is `python3 -m dynamo.frontend` plus NATS + etcd, instead of
+#     `trtllm-serve disaggregated`. Routing happens in the Dynamo KV router, not
+#     in a trtllm-serve master, so there is no generated server_config.yaml.
+#   - the frontend starts FIRST (workers register into its NATS/etcd), the
+#     reverse of the trtllm-serve template's dependency order.
+#   - CONTAINER_IMAGE must include the Dynamo runtime (dynamo.trtllm,
+#     dynamo.frontend, nats-server, etcd, cupy, nixl) — see
+#     scripts/slurm_llm/dynamo_disagg/Dockerfile.dynamo. The default image in
+#     each DYNAMO/Interactive/slurm_env_sflow.yaml is such an image.
+#
+# ============================== DYNAMO NOTES ==============================
+# Flags/env Dynamo needs that plain `trtllm-serve` does NOT:
+#
+#   WORKERS (dynamo.trtllm vs trtllm-serve)
+#     --model-path / --served-model-name   replace trtllm-serve's positional
+#         model arg. The served name is what the harness asks for and what
+#         /v1/models advertises once the worker registers.
+#     --extra-engine-args <yaml>           == trtllm-serve --extra_llm_api_options
+#     --disaggregation-mode prefill|decode selects the worker role. No
+#         trtllm-serve equivalent: trtllm-serve splits roles via the
+#         disaggregated master's server_config instead.
+#     ETCD_ENDPOINTS / NATS_SERVER         service discovery; workers
+#         self-register instead of being listed in a master server_config.
+#     TRTLLM_SERVER_DISABLE_GC=1 / TRTLLM_WORKER_DISABLE_GC=1 / TLLM_LOG_LEVEL=INFO
+#         worker defaults from the v6.0 launcher. Exported BEFORE the per-role
+#         *-env.yaml so a config can still override them (launcher applied the
+#         yaml last).
+#
+#   FRONTEND (dynamo.frontend + NATS + etcd)
+#     nats-server -js                      messaging bus (primary rank only).
+#     etcd --data-dir /dev/shm/...         WAL MUST stay on node-local tmpfs. On
+#         Lustre/NFS the fdatasync stalls, etcd misses lease keep-alives, and
+#         workers deregister mid-run.
+#     etcd --advertise-client-urls http://<primary-ip>:2379   MUST be the real
+#         IP, not 0.0.0.0: a client reconnecting via the advertised member URL
+#         would dial 0.0.0.0 -> its own node -> "tcp connect error" -> lease loss.
+#     SLURM_* stripped from dynamo.frontend's env   otherwise it attempts MPI
+#         init inside this single-task-per-rank step and hangs.
+#     --router-mode / --kv-overlap-score-weight / --router-replica-sync
+#         KV-router knobs, passed via FRONTEND_ROUTER_ARGS. No trtllm-serve
+#         equivalent.
+#     RUST_LOG=warn / DYN_LOG=warn         the KV router logs a cost line for
+#         EVERY worker on EVERY routing decision (~1.2k lines/s/rank, 17.6M/run)
+#         synchronously to the logfile; on a slow FS this stalls the hot path
+#         (TTFT 99.9p 29s) and goes INVALID.
+#
+#   HARNESS
+#     --core_type=trtllm_endpoint          NO Dynamo-specific core is needed: the
+#         Dynamo frontend is OpenAI-compatible, so the stock TRT-LLM endpoint core
+#         drives it unchanged. Worker-registration readiness (workers appear
+#         asynchronously over NATS/etcd) is gated by the wait_for_backends task.
+#     MLPINF_HTTP_USE_COMPLETIONS / MLPINF_USE_DYNAMO   see the mlperf_harness task.
+#     MLPINF_FIRST_TOKEN_ALWAYS=1          always emit FirstTokenComplete, so a
+#         single-chunk (first==final) completion cannot record a sample latency
+#         with no first-token latency. Separate from MLPINF_USE_DYNAMO so the
+#         ~5% stream-drain cost is not forced on DSR1. See FIXA.md.
+# ==========================================================================
+#
+# Pair this template with a config folder containing:
+#   - <benchmark>_config_sflow.yaml  (topology counts, MODEL_PATH,
+#     SERVED_MODEL_NAME, worker yaml paths, router args, harness args)
+#   - slurm_env_sflow.yaml           (container, mounts, slurm backend; defines
+#     the test_container operator)
+#   - dynamo-disagg-{ctx,gen}-*.yaml (ONE engine yaml + ONE env yaml per role —
+#     the golden submission config; no perf/accuracy or ablation variants)
+
+# NOTE: this template intentionally defines NO `variables:` block. It is
+# always the LAST -f file, and sflow's multi-file merge lets later files
+# override earlier ones — a default here would clobber the per-experiment
+# config values (observed: an empty FRONTEND_ROUTER_ARGS default here erased
+# the KV-router args from deepseek_config_sflow.yaml).
+#
+# Supplied by the per-experiment <benchmark>_config_sflow.yaml, the CI
+# generator, and slurm_env_sflow.yaml:
+#   NUM_CTX_SERVERS, GPUS_PER_CTX_RANK, NUM_GEN_SERVERS, GPUS_PER_GEN_RANK,
+#   NUM_FRONTEND_SERVERS, NUM_FRONTEND_NODES, FRONTENDS_PER_NODE (srun places
+#   NUM_FRONTEND_SERVERS ranks over NUM_FRONTEND_NODES nodes with
+#   FRONTENDS_PER_NODE as a per-node CAP, not an exact multiplier: block
+#   distribution fills the first nodes to the cap, so
+#   NUM_FRONTEND_SERVERS <= NUM_FRONTEND_NODES x FRONTENDS_PER_NODE is the
+#   only requirement — e.g. 28 ranks over 18 nodes cap 2 = 10 nodes x2 + 8 x1),
+#   GPUS_PER_NODE, FRONTEND_PORT, MODEL_PATH, SERVED_MODEL_NAME,
+#   TRTLLM_YAML_CTX, TRTLLM_ENV_YAML_CTX, TRTLLM_YAML_GEN, TRTLLM_ENV_YAML_GEN,
+#   FRONTEND_ROUTER_ARGS, BENCHMARK, SCENARIO, SYSTEM_NAME, TEST_MODE,
+#   HARNESS_USE_DYNAMO, HARNESS_EXTRA_ARGS.
+
+
+artifacts:
+  - name: FRONTEND_URLS
+    uri: file://frontend_urls.txt
+    content: ""
+
+
+workflow:
+  name: dynamo_disagg
+  variables:
+    # sflow exposes the allocation's node IPs directly, so NATS/etcd endpoints are
+    # known before anything starts. This replaces the old publish-to-artifact +
+    # poll-for-file dance, and removes the primary/secondary frontend split: every
+    # frontend rank is now identical and just points at the head node's services.
+    HEAD_NODE_IP:
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+    DYN_ETCD_URL:
+      value: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
+    DYN_NATS_URL:
+      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
+
+    # NOTE: CTX_LOAD_STAGGER_S is deliberately NOT declared here. `sflow batch`
+    # composes `-f <config> -f <slurm_env> -f <template>`, so the template is
+    # merged LAST and any default here silently overrides the per-config value
+    # (that is how the first attempt shipped a 0 s stagger and OOM'd again).
+    # Every tunable lives in <benchmark>_config_sflow.yaml; only derived values
+    # belong in this block.
+
+  tasks:
+    # ── infrastructure ────────────────────────────────────────────────────────
+    # NATS and etcd are separate tasks (not folded into the frontend) so a failure
+    # in either is reported as itself instead of surfacing as a frontend readiness
+    # timeout. Both use tcp_port probes, which prove the port is actually
+    # accepting connections — stronger than watching for a log line.
+    - name: nats_server
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - export PYTHONUNBUFFERED=1
+        - nats-server -js -a 0.0.0.0 -p 4222 -m 8222
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+            host: "${{ variables.HEAD_NODE_IP }}"
+            on_node: first
+          timeout: 300
+          interval: 5
+
+    - name: etcd_server
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - export PYTHONUNBUFFERED=1
+        # Dockerfile.dynamo installs etcd into the DIRECTORY /usr/local/bin/etcd/
+        # and bakes it onto PATH via ENV; enroot-exported images lose that ENV, so
+        # restore it here or the spawn hits PermissionError exec'ing the directory.
+        - export PATH=/usr/local/bin/etcd:${PATH}
+        # WAL on node-local tmpfs: on Lustre/NFS the fdatasync stalls, etcd misses
+        # lease keep-alives, and workers deregister mid-run.
+        # NOTE: do NOT name this ETCD_DATA_DIR and do NOT export it. etcd reads
+        # ETCD_* from the environment as its own config, and aborts at startup if a
+        # recognised var is also given as a flag:
+        #   fatal: "conflicting environment variable is shadowed by corresponding
+        #           command-line flag" environment-variable: ETCD_DATA_DIR
+        - WAL_DIR=/dev/shm/etcd_${SLURM_JOB_ID:-0}
+        - mkdir -p "${WAL_DIR}"
+        # --advertise-client-urls MUST be the real node IP, not 0.0.0.0: a client
+        # reconnecting via the advertised member URL would otherwise dial 0.0.0.0
+        # -> its own node -> "tcp connect error" -> lease loss.
+        - >
+          etcd
+          --listen-client-urls http://0.0.0.0:2379
+          --advertise-client-urls ${{ variables.DYN_ETCD_URL }}
+          --data-dir "${WAL_DIR}"
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+            host: "${{ variables.HEAD_NODE_IP }}"
+            on_node: first
+          timeout: 300
+          interval: 5
+
+    # ── routers ───────────────────────────────────────────────────────────────
+    # NUM_FRONTEND_SERVERS router ranks across NUM_FRONTEND_NODES nodes,
+    # FRONTENDS_PER_NODE per node (a CAP under srun block distribution, not an
+    # exact multiplier). Each rank serves on FRONTEND_PORT + SLURM_LOCALID, so
+    # distributed nodes reuse the same port range. All ranks are identical.
+    - name: dynamo_frontend
+      resources:
+        nodes:
+          count: ${{ variables.NUM_FRONTEND_NODES }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.NUM_FRONTEND_SERVERS }}
+        ntasks_per_node: ${{ variables.FRONTENDS_PER_NODE }}
+      script:
+        - export PYTHONUNBUFFERED=1
+        - export ETCD_ENDPOINTS=${{ variables.DYN_ETCD_URL }} NATS_SERVER=${{ variables.DYN_NATS_URL }}
+        # The KV router logs a cost line for EVERY worker on EVERY routing decision
+        # (~1.2k lines/s/rank) synchronously to the logfile; on a slow FS this
+        # stalls the hot path (TTFT 99.9p 29s) and goes INVALID.
+        - export RUST_LOG=warn DYN_LOG=warn
+        - MY_HOST=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f$(( ${SLURM_NODEID:-0} + 1 )))
+        - MY_PORT=$(( ${{ variables.FRONTEND_PORT }} + ${SLURM_LOCALID:-0} ))
+        - echo "${MY_HOST}:${MY_PORT}" >> ${{ artifacts.FRONTEND_URLS.path }}
+        # Strips SLURM_* for the child only (MY_PORT is computed from SLURM_LOCALID
+        # above, before the strip).
+        #
+        # Carried over from RunDisaggFrontendOp on main, which did the same with the
+        # comment "remove SLURM variables to avoid MPI initialization issues in
+        # dynamo.frontend". Kept when the wrapper was dropped so behaviour did not
+        # change silently.
+        #
+        # DO NOT REMOVE. It costs latency, not correctness, which is why it looks
+        # unnecessary from a functional test.
+        #
+        # dynamo.frontend starts and serves /v1/models fine with SLURM_* present —
+        # verified on a single node, 5 ranks, --mpi pmix: no MPI init, no pmix
+        # error, identical startup either way. But the run is graded on the tail,
+        # and at full scale the tail is where it shows up. Measured at x72 on
+        # 2026-07-28 with the strip removed:
+        #   gpt-oss GB200 : TPOT p99 14.82 ms -> 16.42 ms, INVALID (SLO 15 ms),
+        #                   throughput essentially unchanged (625,413 vs 625,205)
+        #   DSR1 GB200    : 237,522 vs 239,540 tok/s with the same npw config,
+        #                   i.e. -0.84% purely from dropping the strip
+        # Unchanged throughput with a worse tail points at per-rank CPU affinity:
+        # with SLURM_* present OMPI/PMIx binds the process, and pinning 24 router
+        # ranks hurts tail latency without touching aggregate rate. Not confirmed.
+        - |
+          UNSET_ARGS=""
+          for v in $(env | grep -o '^SLURM_[A-Za-z0-9_]*'); do UNSET_ARGS="${UNSET_ARGS} -u ${v}"; done
+          echo "frontend rank ${SLURM_PROCID:-0} -> ${MY_HOST}:${MY_PORT}, etcd ${ETCD_ENDPOINTS}, nats ${NATS_SERVER}"
+          exec env ${UNSET_ARGS} python3 -m dynamo.frontend \
+            --http-port ${MY_PORT} \
+            ${{ variables.FRONTEND_ROUTER_ARGS }}
+      probes:
+        readiness:
+          # Probes the first router (head node, base port). Whole-cluster readiness
+          # — including worker registration — is gated by wait_for_backends below.
+          tcp_port:
+            port: ${{ variables.FRONTEND_PORT }}
+            host: "${{ variables.HEAD_NODE_IP }}"
+            on_node: first
+          timeout: 600
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    # ── engine workers ────────────────────────────────────────────────────────
+    # Workers depend on NATS/etcd only, not on the frontend, so model load runs in
+    # parallel with router bring-up.
+    - name: prefill_worker
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_CTX_RANK }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.GPUS_PER_CTX_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_CTX_RANK, variables.GPUS_PER_NODE] | min }}
+      script:
+        - export PYTHONUNBUFFERED=1
+        - export ETCD_ENDPOINTS=${{ variables.DYN_ETCD_URL }} NATS_SERVER=${{ variables.DYN_NATS_URL }}
+        # Per-rank caches. These CANNOT move into the *-env.yaml: run_with_env.py
+        # emits `export K='V'` in single quotes, so ${SLURM_PROCID} would be written
+        # literally and every rank would share one directory — which is the
+        # /root/.cache race that killed 36/36 ranks on gpt-oss GB300.
+        - export FLASHINFER_WORKSPACE_BASE=/tmp/${SLURM_JOB_USER:-${USER}}/flashinfer_${SLURM_JOB_ID}_${SLURM_PROCID}
+        # Scope the per-rank redirect to the dynamic-module dir ONLY. That is the
+        # thing that actually raced: transformers' loader calls
+        # pathlib.mkdir(parents=True) on /root/.cache/huggingface/modules, which
+        # races on the parent across co-located ranks (FileExistsError, 36/36
+        # ranks dead on gpt-oss GB300).
+        #
+        # Do NOT redirect all of HF_HOME here. /tmp on these nodes is tmpfs
+        # (verified on lyris theia0252: `tmpfs 478G /tmp`, 955G RAM), so moving
+        # the whole HF tree per-rank would put the checkpoint cache in host RAM
+        # on a node that is already close to its ceiling. Scope the redirect to
+        # the one directory that actually races and no further. This is a
+        # headroom precaution, NOT the cause of the GB300 prefill OOM — that was
+        # concurrent weight materialisation by co-located CTX replicas.
+        - export HF_MODULES_CACHE=/tmp/${SLURM_JOB_USER:-${USER}}/hfmod_${SLURM_JOB_ID}_${SLURM_PROCID}
+        - mkdir -p "${FLASHINFER_WORKSPACE_BASE}" "${HF_MODULES_CACHE}"
+        # Unique llmapi proxy IPC address per co-located replica.
+        - export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="tcp://127.0.0.1:$(( 10012 + ${SFLOW_REPLICA_INDEX} % ${{ variables.GPUS_PER_NODE }} ))"
+        # Static engine env (GC, log level, CUDA_DEVICE_MAX_CONNECTIONS, MoE flags)
+        # lives in the per-role env yaml.
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML_CTX }} | tee /dev/stderr)"
+        - echo "prefill replica ${SFLOW_REPLICA_INDEX} rank ${SLURM_PROCID:-0} -> etcd ${ETCD_ENDPOINTS}"
+        # Co-located CTX replicas must not materialise weights at the same time.
+        #
+        # TRT-LLM decides per-rank, with no cross-rank coordination
+        # (_torch/models/checkpoints/hf/weight_loader.py):
+        #     enable_prefetch = prefetch_size < psutil.virtual_memory().available * 0.9
+        # prefetch_size is the WHOLE checkpoint (384.94 GB for DSR1 FP4), and
+        # psutil reads the host's /proc/meminfo, so all four co-located ranks
+        # independently conclude the prefetch is safe and all four do it.
+        #
+        # Measured on lyris theia0252 (GB300, 955 GB RAM, 2 x DEP2 per node):
+        #   simultaneous : peak anon 686 GB, min available  20 GB
+        #   75 s stagger : peak anon 369 GB, min available 327 GB
+        # Host anon is released once weights reach the GPU, so separating the
+        # peaks is enough — nothing needs to shrink.
+        #
+        # 20 GB of headroom is not survivable on this cluster: each additional
+        # container step on a node costs 55.3 GB of tmpfs (measured, linear
+        # across 5 steps), because the container root is RAM-backed. That is
+        # what made splitting nats/etcd into their own tasks (+2 containers,
+        # +110.6 GB on node 0) OOM-kill prefill at ~92% of weight load while
+        # every other input — image, engine yaml, placement, sflow pin — was
+        # byte-identical to the last VALID run (job 371012300, 253,866 tok/s).
+        - export CTX_PER_NODE=$(( ${{ variables.GPUS_PER_NODE }} / ${{ variables.GPUS_PER_CTX_RANK }} )); [ "${CTX_PER_NODE}" -ge 1 ] || export CTX_PER_NODE=1
+        - export CTX_STAGGER=$(( ( ${SFLOW_REPLICA_INDEX} % ${CTX_PER_NODE} ) * ${{ variables.CTX_LOAD_STAGGER_S }} ))
+        # NOTE: single-quoted — an unquoted scalar containing ": " parses as a
+        # YAML mapping and sflow then rejects the task ("Input should be a valid
+        # string").
+        - 'if [ "${CTX_STAGGER}" -gt 0 ]; then echo "prefill replica ${SFLOW_REPLICA_INDEX} staggering weight load by ${CTX_STAGGER}s (${CTX_PER_NODE} CTX replicas per node)"; sleep "${CTX_STAGGER}"; fi'
+        - >
+          trtllm-llmapi-launch
+          python3 -m dynamo.trtllm
+          --model-path ${{ variables.MODEL_PATH }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --extra-engine-args ${{ variables.TRTLLM_YAML_CTX }}
+          --disaggregation-mode prefill
+          2>&1 | tee ${SFLOW_TASK_OUTPUT_DIR}/prefill_dp${SFLOW_REPLICA_INDEX}_rank${SLURM_PROCID:-0}.log
+      probes:
+        readiness:
+          # "Model init total" is TRT-LLM's engine-fully-loaded marker. Workers do
+          # not listen on a port, so there is nothing to tcp_port probe here.
+          log_watch:
+            regex_pattern: "Model init total"
+          timeout: 1800
+          interval: 10
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: decode_worker
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_GEN_RANK }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.GPUS_PER_GEN_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_GEN_RANK, variables.GPUS_PER_NODE] | min }}
+      script:
+        - export PYTHONUNBUFFERED=1
+        - export ETCD_ENDPOINTS=${{ variables.DYN_ETCD_URL }} NATS_SERVER=${{ variables.DYN_NATS_URL }}
+        # See prefill_worker for why these stay here and not in the env yaml.
+        - export FLASHINFER_WORKSPACE_BASE=/tmp/${SLURM_JOB_USER:-${USER}}/flashinfer_${SLURM_JOB_ID}_${SLURM_PROCID}
+        # Scope the per-rank redirect to the dynamic-module dir ONLY. That is the
+        # thing that actually raced: transformers' loader calls
+        # pathlib.mkdir(parents=True) on /root/.cache/huggingface/modules, which
+        # races on the parent across co-located ranks (FileExistsError, 36/36
+        # ranks dead on gpt-oss GB300).
+        #
+        # Do NOT redirect all of HF_HOME here. /tmp on these nodes is tmpfs
+        # (verified on lyris theia0252: `tmpfs 478G /tmp`, 955G RAM), so moving
+        # the whole HF tree per-rank would put the checkpoint cache in host RAM
+        # on a node that is already close to its ceiling. Scope the redirect to
+        # the one directory that actually races and no further. This is a
+        # headroom precaution, NOT the cause of the GB300 prefill OOM — that was
+        # concurrent weight materialisation by co-located CTX replicas.
+        - export HF_MODULES_CACHE=/tmp/${SLURM_JOB_USER:-${USER}}/hfmod_${SLURM_JOB_ID}_${SLURM_PROCID}
+        - mkdir -p "${FLASHINFER_WORKSPACE_BASE}" "${HF_MODULES_CACHE}"
+        - export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="tcp://127.0.0.1:$(( 10012 + ${SFLOW_REPLICA_INDEX} % ${{ variables.GPUS_PER_NODE }} ))"
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML_GEN }} | tee /dev/stderr)"
+        - echo "decode replica ${SFLOW_REPLICA_INDEX} rank ${SLURM_PROCID:-0} -> etcd ${ETCD_ENDPOINTS}"
+        - >
+          trtllm-llmapi-launch
+          python3 -m dynamo.trtllm
+          --model-path ${{ variables.MODEL_PATH }}
+          --served-model-name ${{ variables.SERVED_MODEL_NAME }}
+          --extra-engine-args ${{ variables.TRTLLM_YAML_GEN }}
+          --disaggregation-mode decode
+          2>&1 | tee ${SFLOW_TASK_OUTPUT_DIR}/decode_dp${SFLOW_REPLICA_INDEX}_rank${SLURM_PROCID:-0}.log
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Model init total"
+          timeout: 1800
+          interval: 10
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    # ── cluster readiness gate ────────────────────────────────────────────────
+    # Worker readiness above only proves each engine loaded. Registration with the
+    # frontend happens asynchronously over NATS/etcd afterwards, so the model can
+    # be absent from /v1/models even when every worker is "ready". This step is
+    # what used to be DynamoEndpointCore's health-check override; as its own task
+    # a registration failure is reported here instead of as a harness error.
+    - name: wait_for_backends
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - |
+          python3 - <<'PYEOF'
+          import json, sys, time, urllib.request
+          base = "http://${{ variables.HEAD_NODE_IP }}:${{ variables.FRONTEND_PORT }}"
+          model = "${{ variables.SERVED_MODEL_NAME }}"
+          expected = ${{ variables.NUM_CTX_SERVERS + variables.NUM_GEN_SERVERS }}
+          deadline = time.monotonic() + 1800
+
+          def get(path):
+              with urllib.request.urlopen(base + path, timeout=5) as r:
+                  return json.loads(r.read())
+
+          while time.monotonic() < deadline:
+              try:
+                  models = [m.get("id") for m in get("/v1/models").get("data", [])]
+                  try:
+                      instances = get("/health").get("instances") or []
+                  except Exception:
+                      instances = []
+                  print(f"[wait_for_backends] models={models} instances={len(instances)}/{expected}", flush=True)
+                  # Hard gate: the served model must be registered. Instance count is
+                  # logged for diagnosis but not enforced -- TRT-LLM worker endpoint
+                  # naming is not verified yet; tighten once confirmed.
+                  if model in models:
+                      print("[wait_for_backends] model registered", flush=True)
+                      sys.exit(0)
+              except Exception as e:
+                  print(f"[wait_for_backends] poll error: {e}", flush=True)
+              time.sleep(5)
+          print("[wait_for_backends] timed out waiting for model registration", file=sys.stderr)
+          sys.exit(1)
+          PYEOF
+      depends_on:
+        - dynamo_frontend
+        - prefill_worker
+        - decode_worker
+
+    # ── warm-up ───────────────────────────────────────────────────────────────
+    # PERFORMANCE fix, NOT a readiness check. wait_for_backends above already
+    # proves the cluster is up; this pushes a real 1-token completion through
+    # EVERY frontend so CUDA graphs, the KV router and the NIXL transfer path are
+    # all warm before loadgen's first query. It reproduces what the v6.0
+    # launcher's wait_for_servers_ready() did.
+    #
+    # DO NOT delete this as "duplicate endpoint verification". It was removed once
+    # on that reasoning and DSR1 GB200 immediately regressed from ~240k to ~229k
+    # tok/s (~5%); it had also been dropped once before by an earlier rewrite.
+    # The harness's own WarmupManager warms each core through the scheduler, which
+    # does not guarantee every frontend replica is exercised.
+    - name: warmup_frontends
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - export PYTHONUNBUFFERED=1
+        - FRONTEND_URLS=$(grep -v '^[[:space:]]*$' ${{ artifacts.FRONTEND_URLS.path }} | paste -sd ',')
+        - echo "warming ${FRONTEND_URLS}"
+        - |
+          MODEL_ID=$(curl -sf "http://$(echo ${FRONTEND_URLS} | cut -d',' -f1)/v1/models" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])")
+          echo "model id: ${MODEL_ID}"
+          for u in $(echo ${FRONTEND_URLS} | tr ',' ' '); do
+            for _i in $(seq 1 60); do
+              curl -sf -m 120 "http://${u}/v1/completions" -H 'Content-Type: application/json' \
+                -d "{\"model\": \"${MODEL_ID}\", \"prompt\": \"warmup\", \"max_tokens\": 1}" >/dev/null && break
+              sleep 5
+            done
+            echo "warm request done via ${u}"
+          done
+      depends_on:
+        - wait_for_backends
+
+    # ── loadgen client ────────────────────────────────────────────────────────
+    - name: mlperf_harness
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        # Only the harness needs nv_mlpinf; /work/src makes the CHECKOUT
+        # authoritative over any copy baked into the image. No FlashInfer/HF cache
+        # here — the harness is a loadgen client and runs no engine.
+        - export PYTHONUNBUFFERED=1 PYTHONPATH=/work/src:${PYTHONPATH:-}
+        # Pinned mlcommons-loadgen wheel: the image's baked loadgen is stale and
+        # stamps the wrong RNG seed. Only this rank installs, so no install race.
+        - pip install -e ".[llm]" -q --no-build-isolation
+        # MLPINF_USE_DYNAMO (HARNESS_USE_DYNAMO) is 0 for BOTH benchmarks. At 1 it
+        # sets NOSKIP_FINAL_CHUNK, which keeps the client reading past finish_reason
+        # waiting for [DONE]; if the frontend half-closes, the read blocks forever
+        # and wedges loadgen's no-timeout drain (job 372979108: 233 min of silence,
+        # 7,501 samples outstanding, killed at walltime, no summary). At 0 the client
+        # breaks at finish_reason and closes, so that cannot happen.
+        # MLPINF_FIRST_TOKEN_ALWAYS=1: loadgen needs a first-token latency before a
+        # sample latency; a completion shorter than stream_interval arrives as ONE
+        # chunk that is both first and final. This is what gpt-oss used to need
+        # USE_DYNAMO=1 for, which is why 0 is now correct for both — measured
+        # first-token latency is real at 0 (gpt-oss 42 ms, DSR1 190-352 ms), never
+        # kInvalidLatency.
+        - export MLPINF_HTTP_USE_COMPLETIONS=1 MLPINF_USE_DYNAMO=${{ variables.HARNESS_USE_DYNAMO }} MLPINF_FIRST_TOKEN_ALWAYS=1
+        - FRONTEND_URLS=$(grep -v '^[[:space:]]*$' ${{ artifacts.FRONTEND_URLS.path }} | paste -sd ',')
+        - echo "Frontend URLs ${FRONTEND_URLS}"
+        # Endpoint readiness and warm-up are handled by the harness itself
+        # (WarmupManager runs a health check plus real warmup queries against every
+        # core, one core per URL) and by wait_for_backends above.
+        - |
+          set +e
+          set -o pipefail
+          HARNESS_LOG=${SFLOW_TASK_OUTPUT_DIR}/${{ variables.TEST_MODE }}.log
+          LOG_DIR=${SFLOW_TASK_OUTPUT_DIR}/${{ variables.TEST_MODE }} \
+            nv-mlpinf run_harness \
+              --benchmarks=${{ variables.BENCHMARK }} \
+              --scenarios=${{ variables.SCENARIO }} \
+              --system_name=${{ variables.SYSTEM_NAME }} \
+              --core_type=trtllm_endpoint \
+              --trtllm_server_urls=${FRONTEND_URLS} \
+              --test_mode=${{ variables.TEST_MODE }} \
+              ${{ variables.HARNESS_EXTRA_ARGS }} 2>&1 | tee "${HARNESS_LOG}"
+          HARNESS_EXIT=$?
+          echo "=== mlperf_harness run_harness exited with ${HARNESS_EXIT}; outside validation will decide job status ==="
+          exit 0
+      depends_on:
+        - warmup_frontends

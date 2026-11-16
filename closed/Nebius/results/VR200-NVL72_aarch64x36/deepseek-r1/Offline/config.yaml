@@ -1,4 +1,4 @@
-name: dsr1-gr100-offline-disagg-4c8g-x72-submission
+name: dsr1-vr-offline-dynamo-2c4g-x36
 version: '1.0'
 type: offline
 benchmark_mode: offline
@@ -11,14 +11,14 @@ model_params:
   min_new_tokens: 1
   skip_special_tokens: true
   streaming: 'off'
-  tokenizer_name: /model
+  tokenizer_name: /mnt/nfs/mlperf_inference_v6.1/mlperf_scratch/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4-v2
 datasets:
 - name: dsr1-perf
   type: performance
-  path: /work/dataset/ds-r1/deepseek_r1_eval.parquet
+  path: /mnt/nfs/mlperf_inference_v6.1/mlperf_scratch/data/deepseek-r1-endpoints/deepseek_r1_eval.parquet
 - name: deepseek_r1_accuracy
   type: accuracy
-  path: /work/dataset/ds-r1/deepseek_r1_eval.parquet
+  path: /mnt/nfs/mlperf_inference_v6.1/mlperf_scratch/data/deepseek-r1-endpoints/deepseek_r1_eval.parquet
   accuracy_config:
     eval_method: legacy_mlperf_deepseek_r1
     ground_truth: ground_truth
@@ -26,12 +26,12 @@ datasets:
     extras:
       subset_column: dataset
       question_column: question
-      tokenizer_path: /model
+      tokenizer_path: /mnt/nfs/mlperf_inference_v6.1/mlperf_scratch/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4-v2
 settings:
   runtime:
     min_duration_ms: 5400000
     max_duration_ms: 9540000
-    n_samples_to_issue: 800000
+    n_samples_to_issue: 1000000
     scheduler_random_seed: 16159082839903944936
     dataloader_random_seed: 2747215439041700203
   load_pattern:
@@ -40,7 +40,9 @@ settings:
     num_workers: 32
     log_level: INFO
     warmup_connections: -1
-    max_connections: 40000
+    auto_warmup_budget_fraction: 0.25
+    max_concurrent_warmup_connects: 128
+    max_connections: 81920
     transport:
       type: zmq
       recv_buffer_size: 16777216
@@ -68,14 +70,20 @@ settings:
     drain: false
     warmup_random_seed: 42
   profiling: {}
+  early_stopping:
+    enabled: true
   service_ready_timeout_s: 30.0
 endpoint_config:
   endpoints:
-  - http://10.1.0.237:8001
-  - http://10.1.0.231:8003
-  - http://10.1.0.247:8002
-  - http://10.1.0.236:8000
+  - http://8b40-11:8000
+  - http://8b40-11:8001
+  - http://8b40-11:8002
+  - http://8b40-11:8003
+  - http://8b40-11:8004
+  - http://8b40-11:8005
+  - http://8b40-11:8006
+  - http://8b40-11:8007
   api_type: openai_completions
-report_dir: /place/nfs/slurm/mlperf/vr200/dsr1-nvl72-partner-drop-final/sflow_output/trtllm_disagg-20260731-091819-9dbd20/endpoint_benchmark
+report_dir: /mnt/nfs/mlperf_inference_v6.1/nv-mlpinf-partner/closed/NVIDIA/sflow_output/1742-dynamo_disagg_half_rack9_dsr1_perf_acc-20261030-203811-0874cb/endpoint_benchmark
 verbose: false
 enable_cpu_affinity: true

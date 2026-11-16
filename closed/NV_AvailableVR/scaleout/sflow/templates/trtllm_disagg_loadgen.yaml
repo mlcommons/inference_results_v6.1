@@ -1,0 +1,187 @@
+version: "0.1"
+
+# Disaggregated (prefill/decode split) workflow with MLPerf loadgen client.
+# Launches NUM_CTX_SERVERS prefill replicas, NUM_GEN_SERVERS decode replicas, and
+# NUM_FRONTEND_SERVERS load-balancing frontends, then runs nv-mlpinf run_harness.
+#
+# Pair this template with a config folder containing:
+#   - <benchmark>_config_sflow.yaml  (workflow variables: server counts, model/yaml paths, harness args)
+#   - slurm_env_sflow.yaml      (container, mounts, slurm backend; defines test_container operator)
+#   - trtllm-serve-disagg-*-{,env-}yaml  (per-rank trtllm-serve configs)
+
+variables:
+  COLLECT_NSYS:
+    description: "Set to 1 to collect one nsys profile per prefill/decode trtllm-serve rank. GPU metrics are restricted to each rank's SLURM_LOCALID."
+    value: "0"
+  PATCH_TRTLLM_DISAGG_DEBUG_LOGS:
+    description: "Set to 1 to remove TensorRT-LLM disagg debug logs that access ctx_request_id, matching NVIDIA/TensorRT-LLM@7212c43."
+    value: "0"
+  # NUM_CTX_SERVERS, NUM_GEN_SERVERS, NUM_FRONTEND_SERVERS, GPUS_PER_CTX_RANK,
+  # GPUS_PER_GEN_RANK, GPUS_PER_NODE, BASE_PORT, FRONTEND_PORT, MODEL_PATH,
+  # TRTLLM_YAML_CTX, TRTLLM_YAML_GEN, TRTLLM_ENV_YAML_CTX, TRTLLM_ENV_YAML_GEN,
+  # BENCHMARK, SCENARIO, SYSTEM_NAME, TEST_MODE, HARNESS_EXTRA_ARGS are supplied by the
+  # per-experiment <benchmark>_config_sflow.yaml, CI generator, and slurm_env_sflow.yaml.
+
+artifacts:
+  - name: CTX_URLS
+    uri: file://ctx_urls.txt
+    content: ""
+  - name: GEN_URLS
+    uri: file://gen_urls.txt
+    content: ""
+  - name: FRONTEND_URLS
+    uri: file://frontend_urls.txt
+    content: ""
+
+
+
+workflow:
+  name: trtllm_disagg
+  tasks:
+    - name: prefill_server
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_CTX_RANK }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.GPUS_PER_CTX_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_CTX_RANK, variables.GPUS_PER_NODE] | min }}
+      script:
+        # Register this replica's URL into CTX_URLS (plain ip:port, one per line)
+        - if [ "${SLURM_PROCID:-0}" = "0" ]; then echo "$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1):$(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX} ))" >> ${{ artifacts.CTX_URLS.path }}; fi
+        # Load env.yaml: print each export to stderr (logged), then eval to apply in current shell
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML_CTX }} | tee /dev/stderr)"
+        # Separate FlashInfer cache per rank to reduce compile-cache read failures from all ranks reading the same home directory.
+        - export FLASHINFER_WORKSPACE_BASE=/tmp/${SLURM_JOB_USER:-${USER}}/flashinfer_${SLURM_JOB_ID}_${SLURM_PROCID}
+        - mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
+        - >
+          NSYS_CMD="";
+          if [ "${{ variables.COLLECT_NSYS }}" = "1" ]; then
+            NSYS_CMD="/usr/local/bin/nsys profile --force-overwrite=true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace=node --capture-range-end=stop --gpu-metrics-devices=${SLURM_LOCALID} --wait=all --output ${SFLOW_TASK_OUTPUT_DIR}/nsys_profile-prefill-dp${SFLOW_REPLICA_INDEX}-rank${SLURM_PROCID}";
+          fi;
+          ${NSYS_CMD} trtllm-llmapi-launch
+          trtllm-serve ${{ variables.MODEL_PATH }}
+          --host 0.0.0.0
+          --port $(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX} ))
+          --extra_llm_api_options ${{ variables.TRTLLM_YAML_CTX }}
+          2>&1 | tee ${SFLOW_TASK_OUTPUT_DIR}/prefill_rank${SLURM_PROCID}.log
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 600
+          interval: 10
+
+    - name: decode_server
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_GEN_RANK }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.GPUS_PER_GEN_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_GEN_RANK, variables.GPUS_PER_NODE] | min }}
+      script:
+        # Register this replica's URL into GEN_URLS; port offset by NUM_CTX_SERVERS to avoid collision with ctx ports
+        - if [ "${SLURM_PROCID:-0}" = "0" ]; then echo "$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1):$(( ${{ variables.BASE_PORT }} + ${{ variables.NUM_CTX_SERVERS }} + ${SFLOW_REPLICA_INDEX} ))" >> ${{ artifacts.GEN_URLS.path }}; fi
+        # Load env.yaml: print each export to stderr (logged), then eval to apply in current shell
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML_GEN }} | tee /dev/stderr)"
+        # Separate FlashInfer cache per rank to reduce compile-cache read failures from all ranks reading the same home directory.
+        - export FLASHINFER_WORKSPACE_BASE=/tmp/${SLURM_JOB_USER:-${USER}}/flashinfer_${SLURM_JOB_ID}_${SLURM_PROCID}
+        - mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
+        - >
+          NSYS_CMD="";
+          if [ "${{ variables.COLLECT_NSYS }}" = "1" ]; then
+            NSYS_CMD="/usr/local/bin/nsys profile --force-overwrite=true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace=node --capture-range-end=stop --gpu-metrics-devices=${SLURM_LOCALID} --wait=all --output ${SFLOW_TASK_OUTPUT_DIR}/nsys_profile-decode-dp${SFLOW_REPLICA_INDEX}-rank${SLURM_PROCID}";
+          fi;
+          ${NSYS_CMD} trtllm-llmapi-launch
+          trtllm-serve ${{ variables.MODEL_PATH }}
+          --host 0.0.0.0
+          --port $(( ${{ variables.BASE_PORT }} + ${{ variables.NUM_CTX_SERVERS }} + ${SFLOW_REPLICA_INDEX} ))
+          --extra_llm_api_options ${{ variables.TRTLLM_YAML_GEN }}
+          2>&1 | tee ${SFLOW_TASK_OUTPUT_DIR}/decode_rank${SLURM_PROCID}.log
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 600
+          interval: 10
+
+    # Each frontend replica reads all ctx/gen URLs, assembles its own server_config,
+    # then starts a trtllm-serve disaggregated endpoint on FRONTEND_PORT + replica_idx.
+    # All frontends share the same set of ctx/gen workers; the harness load-balances across them.
+    - name: frontend_server
+      replicas:
+        count: ${{ variables.NUM_FRONTEND_SERVERS }}
+        policy: parallel
+      resources:
+        nodes:
+          count: 1
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - FRONTEND_MY_PORT=$(( ${{ variables.FRONTEND_PORT }} + ${SFLOW_REPLICA_INDEX} ))
+        - MY_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - MY_CONFIG=${SFLOW_TASK_OUTPUT_DIR}/server_config_${SFLOW_REPLICA_INDEX}.yaml
+        - CTX_URLS_LIST=$(grep -v '^[[:space:]]*$' ${{ artifacts.CTX_URLS.path }} | paste -sd ',')
+        - GEN_URLS_LIST=$(grep -v '^[[:space:]]*$' ${{ artifacts.GEN_URLS.path }} | paste -sd ',')
+        - >
+          python3 /work/scaleout/sflow/tools/generate_master_yaml.py
+          --hostname "${MY_IP}"
+          --port "${FRONTEND_MY_PORT}"
+          --ctx-urls "${CTX_URLS_LIST}"
+          --gen-urls "${GEN_URLS_LIST}"
+          --output "${MY_CONFIG}"
+          --register-url-to ${{ artifacts.FRONTEND_URLS.path }}
+        - if [ "${{ variables.PATCH_TRTLLM_DISAGG_DEBUG_LOGS }}" = "1" ]; then python3 /work/scaleout/sflow/tools/patch_trtllm_disagg_debug_logs.py; fi
+        - trtllm-serve disaggregated -c "${MY_CONFIG}" --request_timeout 7200 --server_start_timeout 7200
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 120
+          interval: 10
+      depends_on:
+        - prefill_server
+        - decode_server
+
+    - name: mlperf_harness
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        # Install nv-mlpinf into this task's container — only the harness needs
+        # it (trtllm-serve workers don't import nv_mlpinf). PYTHONUNBUFFERED so
+        # progress streams to sflow.log without buffering.
+        - export PYTHONUNBUFFERED=1
+        - pip install -e ".[llm]" -q --no-build-isolation
+        - FRONTEND_URLS=$(grep -v '^[[:space:]]*$' ${{ artifacts.FRONTEND_URLS.path }} | paste -sd ',')
+        - echo "Frontend URLs ${FRONTEND_URLS}"
+        - |
+          set +e
+          set -o pipefail
+          HARNESS_LOG=${SFLOW_TASK_OUTPUT_DIR}/${{ variables.TEST_MODE }}.log
+          LOG_DIR=${SFLOW_TASK_OUTPUT_DIR}/${{ variables.TEST_MODE }} \
+            nv-mlpinf run_harness \
+              --benchmarks=${{ variables.BENCHMARK }} \
+              --scenarios=${{ variables.SCENARIO }} \
+              --system_name=${{ variables.SYSTEM_NAME }} \
+              --trtllm_server_urls=${FRONTEND_URLS} \
+              --test_mode=${{ variables.TEST_MODE }} \
+              ${{ variables.HARNESS_EXTRA_ARGS }} 2>&1 | tee "${HARNESS_LOG}"
+          HARNESS_EXIT=$?
+          echo "=== mlperf_harness run_harness exited with ${HARNESS_EXIT}; outside validation will decide job status ==="
+          exit 0
+      depends_on:
+        - frontend_server

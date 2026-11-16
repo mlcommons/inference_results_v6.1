@@ -1,0 +1,11 @@
+# nv_mlpinf paths configuration
+# Edit this file to change runtime paths. Changes take effect immediately on next run.
+# Override individual paths per-invocation via env vars (e.g. BUILD_DIR=/tmp nv-mlpinf ...).
+
+project_base_dir: /work
+build_dir: /work/build
+mlperf_scratch_path: /home/mlperf_inference_storage
+trtllm_dir: /work/3rdparty/trtllm
+mlcommons_inf_repo: /work/3rdparty/mlc-inference
+results_submission_dir: /work/build/artifacts
+results_staging_dir: /work/build/submission-staging

@@ -1,0 +1,37 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# wan22-a14b VisualGen TE FP8 server image — assembled from the TRT-LLM SBSA
+# devel base + the prebuilt sm100+sm103 wheel. Built daemonless by kaniko
+# (register_server_image_kaniko.sh) on the enroot/pyxis cluster (no docker).
+#
+# Build context must contain: this file, requirements.txt (from the trtllm repo),
+# and the prebuilt tensorrt_llm-*.whl (sm100;103). BASE_IMAGE is the
+# LLM_SBSA_DOCKER_IMAGE from <trtllm>/jenkins/current_image_tags.properties.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Mirror Dockerfile.multi: drop the base image's conflicting cutlass-dsl (its
+# symbols don't match the built wheel) + any stale tensorrt_llm.
+RUN pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy tensorrt_llm || true \
+ && rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/nvidia_cutlass_dsl*
+
+# Runtime deps (blake3, cutlass-dsl==4.5.0, modelopt, ...) + VisualGen-only extra,
+# then the prebuilt wheel (--no-deps so versions stay wheel-compatible).
+COPY requirements.txt /tmp/requirements.txt
+COPY constraints.txt /tmp/constraints.txt
+COPY tensorrt_llm-*.whl /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+ && pip install --no-cache-dir sageattention==1.0.6 \
+ && pip install --no-cache-dir --no-deps /tmp/tensorrt_llm-*.whl \
+ && rm -f /tmp/tensorrt_llm-*.whl /tmp/requirements.txt
+
+# FA4 enablement guard (HARD, CUDA-free). The x72 full-rack SingleStream replica
+# needs backend: FA4 (CuTe-JIT via flash-attn-4), so the image MUST ship it. Verify
+# presence via importlib.metadata so this fails the build even in a GPU-less sandbox
+# — importing flash_attn.cute / tensorrt_llm needs libcuda, which kaniko lacks.
+RUN python3 -c "import importlib.metadata as m; print('flash-attn-4', m.version('flash-attn-4'), 'present (FA4 dep)')"
+# Backend-Literal (TE+FA4) + functional flash_attn.cute import need a GPU; best-effort
+# in-build only (authoritative verification is post-push via srun --mpi=pmix).
+RUN python3 -c "import tensorrt_llm, tensorrt_llm.visual_gen.args as a; from typing import get_args; b=get_args(a.AttentionConfig.model_fields['backend'].annotation); assert 'TE' in b and 'FA4' in b, f'TE/FA4 backend missing; got {b}'; import importlib; importlib.import_module('flash_attn.cute.interface'); print('TE+FA4 OK', tensorrt_llm.__version__)" || echo "WARN: backend-Literal/import check needs a GPU; verify post-push"

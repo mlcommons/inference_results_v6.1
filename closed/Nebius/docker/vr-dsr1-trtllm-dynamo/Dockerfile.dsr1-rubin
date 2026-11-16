@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# DeepSeek-R1 on Vera Rubin (VR) NVL72: TensorRT-LLM + NVIDIA Dynamo serving image (aarch64, sm_107).
+# Same steps as build_dsr1_rubin_recipe.sbatch; pinned inputs in versions.env. Build context: this directory.
+#   docker buildx build --platform linux/arm64 -f Dockerfile.dsr1-rubin -t <image>:<tag> .
+# TRTLLM_REPO, TRTLLM_REF and TRTLLM_COMMIT default to versions.env; a non-empty --build-arg overrides them.
+
+# Base image (same as BASE_IMAGE_* in versions.env).
+ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc27@sha256:5165023a470f625a5a79046bb55007d45226c40d5d6e98a56c1a1f8546858c45
+
+# TensorRT-LLM source at TRTLLM_COMMIT with its git-lfs content.
+FROM ${BASE_IMAGE} AS src
+SHELL ["/bin/bash", "-c"]
+ARG TRTLLM_REPO=""
+ARG TRTLLM_REF=""
+ARG TRTLLM_COMMIT=""
+RUN --mount=type=bind,source=versions.env,target=/tmp/versions.env \
+    set -euo pipefail; source /tmp/versions.env; \
+    git init -q /src/tensorrt_llm; cd /src/tensorrt_llm; git remote add origin "${TRTLLM_REPO}"; \
+    GIT_LFS_SKIP_SMUDGE=1 git fetch -q --depth 1 origin "${TRTLLM_COMMIT}" || GIT_LFS_SKIP_SMUDGE=1 git fetch -q origin "${TRTLLM_REF}"; \
+    GIT_LFS_SKIP_SMUDGE=1 git checkout -q --detach "${TRTLLM_COMMIT}"; \
+    git lfs install --local; git lfs pull --exclude="**/x86_64-linux-gnu/**,docs/**,triton_backend/**"; \
+    test "$(git rev-parse HEAD)" = "${TRTLLM_COMMIT}"
+
+FROM ${BASE_IMAGE} AS release
+SHELL ["/bin/bash", "-c"]
+ARG TRTLLM_REPO=""
+ARG TRTLLM_REF=""
+ARG TRTLLM_COMMIT=""
+ARG BUILD_JOBS=320
+ENV RECIPE_DIR=/opt/dsr1/recipe
+COPY versions.env ${RECIPE_DIR}/
+COPY steps/ ${RECIPE_DIR}/steps/
+# Steps 10 (Python dependencies), 30 (TensorRT-LLM wheel), 45 (FlashInfer SM107 patch); each sources versions.env.
+RUN --mount=type=bind,from=src,source=/src/tensorrt_llm,target=/src/tensorrt_llm,rw \
+    TRTLLM_SRC=/src/tensorrt_llm BUILD_TMP=/tmp BUILD_DIR=/tmp/dsr1-build WHEEL_OUT=/tmp/dsr1-dist BUILD_JOBS=${BUILD_JOBS} \
+    bash -c 'set -e; for s in 10_pydeps 30_trtllm 45_rubin_extras; do bash ${RECIPE_DIR}/steps/$s.sh; done' \
+    && rm -rf /tmp/dsr1-* /root/.cache/pip
+# Steps 40 (Dynamo, nats-server, etcd) and 50 (checks, /opt/dsr1/BUILD_INFO).
+RUN BUILD_TMP=/tmp bash ${RECIPE_DIR}/steps/40_dynamo.sh && bash ${RECIPE_DIR}/steps/50_finalize.sh && rm -rf /tmp/dsr1-* /root/.cache/pip
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 PRTE_ALLOW_RUN_AS_ROOT=1 PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
+LABEL org.opencontainers.image.title="dsr1-rubin-trtllm-dynamo" \
+      org.opencontainers.image.description="DeepSeek-R1 on Vera Rubin NVL72: TensorRT-LLM + NVIDIA Dynamo" \
+      com.nvidia.mlperf.inference.model="deepseek-r1 (NVFP4)"
+WORKDIR /workspace

@@ -1,0 +1,62 @@
+# inference-endpoint config — VR200x72 Q3VL Offline perf run.
+
+name: "offline-qwen3-vl-235b-a22b-shopify-benchmark"
+version: "1.0"
+type: "offline"
+timeout: 14400
+
+submission_ref:
+  model: "qwen3-vl-235b-a22b"
+  ruleset: "mlperf-inference-v6.1"
+
+model_params:
+  name: "${MODEL_NAME}"
+  max_new_tokens: 150
+
+datasets:
+  - name: shopify_product_catalogue::q3vl
+    type: "performance"
+  - name: shopify_product_catalogue::q3vl
+    type: "accuracy"
+    accuracy_config:
+      eval_method: "shopify_category_f1"
+      ground_truth: "ground_truth_category"
+      extractor: "identity_extractor"
+      num_repeats: 1
+
+settings:
+  # 28800 = TOTAL_GPUS (72) × per-instance (400).
+  warmup:
+    enabled: true
+    n_requests: 28800
+    drain: true
+
+  runtime:
+    # min_duration_ms: 600000  # This is overrided when n_samples to issue is present
+    n_samples_to_issue: 1738404 # 36 repeat of the whole dataset
+    scheduler_random_seed: 42
+    dataloader_random_seed: 42
+
+  load_pattern:
+    type: "max_throughput"
+
+  client:
+    num_workers: 8
+    transport:
+      type: zmq
+      recv_buffer_size: 16777216
+      send_buffer_size: 16777216
+    max_connections: 16384
+    worker_initialization_timeout: 120
+
+  drain:
+    warmup_timeout_s: 240.0 # Warmup drain timeout in seconds (None = wait indefinitely)
+    performance_timeout_s: null # Performance drain timeout in seconds (None = wait indefinitely)
+    accuracy_timeout_s: null # Accuracy drain timeout in seconds (None = wait indefinitely)
+
+endpoint_config:
+  endpoints:
+    - "${FRONTEND_URL:-http://localhost:8000}"
+  api_key: null
+
+report_dir: log_collection/result_collection/hecate/VR200/20260730-172002/base_retries/attempt_7_unconstrained_double_samples/x72_offline

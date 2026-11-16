@@ -1,0 +1,53 @@
+name: dsr1-vr200-offline-submission
+version: "1.0"
+type: submission
+benchmark_mode: offline
+
+model_params:
+  name: DeepSeek-R1-NVFP4-v2-mlpinf
+  tokenizer_name: <MODEL_ROOT>/DeepSeek-R1-NVFP4-v2-mlpinf
+  temperature: 0.0
+  max_new_tokens: 20000
+  top_k: 1
+  top_p: 1.0
+  streaming: 'off'
+
+datasets:
+  - name: dsr1-perf
+    type: performance
+    path: /work/dataset/ds-r1/deepseek_r1_eval.parquet
+  - name: deepseek_r1_accuracy
+    type: accuracy
+    path: /work/dataset/ds-r1/deepseek_r1_eval.parquet
+    accuracy_config:
+      eval_method: legacy_mlperf_deepseek_r1
+      ground_truth: ground_truth
+      num_repeats: 1
+      extras:
+        subset_column: dataset
+        question_column: question
+        tokenizer_path: <MODEL_ROOT>/DeepSeek-R1-NVFP4-v2-mlpinf
+
+settings:
+  runtime:
+    min_duration_ms: 5400000
+    max_duration_ms: 9540000
+    n_samples_to_issue: 1600000
+    scheduler_random_seed: 16159082839903944936
+    dataloader_random_seed: 2747215439041700203
+  load_pattern:
+    type: max_throughput
+  drain:
+    performance_timeout_s: null
+  client:
+    num_workers: 64
+    max_connections: 65536
+    warmup_connections: -1
+    worker_initialization_timeout: 300.0
+
+endpoint_config:
+  endpoints: []
+  api_type: openai_completions
+  api_key: null
+
+report_dir: ${SFLOW_TASK_OUTPUT_DIR}

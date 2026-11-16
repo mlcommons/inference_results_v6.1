@@ -1,0 +1,36 @@
+# info makes the prefill and decode workers log per-request lines. This file does not reach the
+# frontend, which logs per-request route lines even at the template's FRONTEND_DYN_LOG=error.
+# Launch with a runtime sflow that offloads task logs (see README.md).
+DYN_LOG: info
+VLLM_LOGGING_LEVEL: INFO
+VLLM_USE_FLASHINFER_SAMPLER: 1
+VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: 1610612736
+TOKIO_WORKER_THREADS: 64
+OMP_NUM_THREADS: 64
+DYN_REQUEST_PLANE: tcp
+DYN_TCP_REQUEST_TIMEOUT: 300
+DYN_TCP_CONNECT_TIMEOUT: 20
+DYN_TCP_POOL_SIZE: 1024
+DYN_TCP_CHANNEL_BUFFER: 2048
+VLLM_SHM_TENSOR_ARENA: 1
+VLLM_SHM_TENSOR_ARENA_SLOTS: 32
+VLLM_SHM_TENSOR_ARENA_SLOT_MB: 256
+VLLM_SHM_TENSOR_ARENA_MIN_MB: 8
+UCX_RCACHE_MAX_UNRELEASED: '1024'
+UCX_NET_DEVICES: all
+UCX_TLS: 'rc,cuda_copy,cuda_ipc'
+
+# cuDNN 9.26 ships in the image (pip nvidia-cudnn-cu13 9.26.0.51); no LD_LIBRARY_PATH override.
+PYTORCH_SKIP_CUDNN_COMPATIBILITY_CHECK: 1
+
+# Rubin CuTe-DSL attention (all default off in vLLM): ViT FMHA with the persistent kernel,
+# and paged GQA prefill with the tuned per-batch policy. The tuned exports are baked in
+# FlashInfer's pinned cute-dsl artifact collection (flashinfer_cubin/cubins/<pin>/fmha/cute-dsl/);
+# do not set FLASHINFER_DSL_FMHA_LOCAL_DIR.
+VLLM_RUBIN_CUTEDSL_VIT: 1
+VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT: 1
+VLLM_RUBIN_CUTEDSL_PREFILL: 1
+VLLM_RUBIN_CUTEDSL_PREFILL_POLICY: tuned
+
+# Empty = autotune every FlashInfer op, including the nvfp4 GEMMs FlashInfer skips by default.
+VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: ""

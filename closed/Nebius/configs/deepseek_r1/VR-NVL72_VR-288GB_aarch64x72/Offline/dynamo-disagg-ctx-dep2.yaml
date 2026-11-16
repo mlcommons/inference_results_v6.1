@@ -1,0 +1,41 @@
+# DeepSeek-R1, Vera Rubin NVL72 (72 GPUs), Offline: prefill (context) workers, TensorRT-LLM LLM-API options.
+backend: pytorch
+tensor_parallel_size: 2
+moe_expert_parallel_size: 2
+enable_attention_dp: true
+attention_dp_config:
+  enable_balance: false
+  batching_wait_iters: 10
+  timeout_iters: 500
+pipeline_parallel_size: 1
+max_batch_size: 128
+max_num_tokens: 16384
+max_seq_len: 3200
+cuda_graph_config: null
+disable_overlap_scheduler: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.85
+  dtype: nvfp4
+  tokens_per_block: 128
+moe_config:
+  backend: CUTEDSL
+nvfp4_gemm_config:
+  allowed_backends:
+  - cutlass
+  - cublaslt
+  - cuda_core
+cache_transceiver_config:
+  max_tokens_in_buffer: 36864
+  backend: NIXL
+  kv_transfer_timeout_ms: 7200000
+  transceiver_runtime: PYTHON
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: FIRST_COME_FIRST_SERVED
+speculative_config: null
+use_cute_dsl_bf16_bmm: true
+use_cute_dsl_bf16_gemm: true
+print_iter_log: true
+enable_iter_perf_stats: false
+return_perf_metrics: false

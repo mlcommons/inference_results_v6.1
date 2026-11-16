@@ -20,7 +20,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Set up the virtual environment and install sflow
 uv venv
-uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@main"
+uv pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@6efbf59c4a835473b08362eb623358e3ace31d6e"
 source .venv/bin/activate
 ```
 
@@ -93,7 +93,7 @@ sflow batch \
   --set HARNESS_EXTRA_ARGS="--offline_expected_qps=156" \
   --nodes=4 \
   --partition=gb200 \
-  --account=coreai_mlperf_inference \
+  --account=<your-slurm-account> \
   --time=04:00:00 \
   --job-name=gptoss-x72-offline-16gpu \
   -o build/sbatch_scripts_sflow/gptoss_x72_offline_16gpu.sh \
@@ -105,6 +105,20 @@ Notes:
 - `--nodes`, `--partition`, `--account`, `--time` must be passed on the CLI for `sflow batch` (the values in the `backends:` block of `slurm_env_sflow.yaml` are not auto-promoted to sbatch directives). Pick `--nodes` to match the scaled `TOTAL_GPUS / GPUS_PER_NODE`.
 - The generated sbatch script handles everything else — including bootstrapping a compute-node sflow venv on first run — so subsequent submissions land much faster.
 - For Interactive (2 CTX + 1 GEN = 6 GPUs / 2 nodes), swap the config paths to `.../Interactive/` and the template to `trtllm_disagg_loadgen.yaml`, pass `--set NUM_CTX_SERVERS=2 --set NUM_GEN_SERVERS=1 --set NUM_FRONTEND_SERVERS=1 --set TEST_MODE=PerformanceOnly --set HARNESS_EXTRA_ARGS="--server_target_qps=40"`, and set `--nodes=2`.
+
+---
+
+## DeepSeek-R1 on Vera Rubin NVL72 (TensorRT-LLM + NVIDIA Dynamo + MLPerf Endpoints client)
+
+| File | Role |
+| --- | --- |
+| `templates/dynamo_disagg_rack18_endpoints_dsr1_perf_acc.yaml` | one NVL72 rack (18 nodes, `--segment=18`): four 18-GPU prefill/decode pairs |
+| `tools/dynamo_trtllm_worker.sh` | one `dynamo.trtllm` prefill/decode worker rank (engine YAML + worker env YAML) |
+| `tools/dynamo_ready.py` | client gate: every frontend serves the model with the expected prefill/decode population |
+
+Configs: `configs/deepseek_r1/VR-NVL72_VR-288GB_aarch64x72/<Scenario>/`; run commands:
+[DeepSeek-R1 README](../../src/nv_mlpinf/benchmarks/deepseek_r1/README.md).
+These use nv-sflow `v0.3.1`, the version the DeepSeek-R1 README installs.
 
 ---
 

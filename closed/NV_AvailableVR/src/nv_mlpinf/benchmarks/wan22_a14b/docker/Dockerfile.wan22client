@@ -1,0 +1,39 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# wan22-a14b endpoint client image — Ubuntu 24.04 + mlcommons/inference-endpoint
+# + libgl1/libglib2.0-0 (opencv cv2 dependency used by the VBench scorer).
+#
+# Build args:
+#   ENDPOINTS_GIT_URL  — defaults to the canonical mlcommons/endpoints repo
+#   ENDPOINTS_GIT_REF  — pinned to the 3rdparty/endpoints submodule commit
+#
+# Built daemonless by register_client_image_kaniko.sh on the enroot/pyxis cluster.
+
+ARG ENDPOINTS_GIT_URL=https://github.com/mlcommons/endpoints.git
+ARG ENDPOINTS_GIT_REF=85a9375df7113a9aa75381367858c806804f0e29
+
+FROM ubuntu:24.04
+
+ARG ENDPOINTS_GIT_URL
+ARG ENDPOINTS_GIT_REF
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# apt in Ubuntu 24.04 tries to setgid to _apt; inside pyxis user-namespace that gid
+# isn't mapped, causing "Could not switch group".  Disable sandbox privilege-drop.
+RUN printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/00sandbox-root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv python3-dev \
+        build-essential git curl ca-certificates \
+        libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv into /usr/local/bin (persists; $HOME is ephemeral in kaniko).
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+
+RUN uv pip install --system \
+        "inference-endpoint @ git+${ENDPOINTS_GIT_URL}@${ENDPOINTS_GIT_REF}" \
+        --break-system-packages \
+    && python3 -c "import inference_endpoint; print('inference-endpoint', inference_endpoint.__file__)"

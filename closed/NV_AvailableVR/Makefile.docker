@@ -1,0 +1,181 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#	 http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+ifndef MAKEFILE_DOCKER_INCLUDED
+MAKEFILE_DOCKER_INCLUDED := 1
+
+# This Makefile includes Docker runtime variables and targets for interactive container sessions,
+# plus base image builders for benchmarks that need custom Docker images (DLRM).
+# nv-mlpinf itself is auto-installed via `ensure_installed` in the main Makefile — no prebuild needed.
+include $(CURDIR)/Makefile.const
+
+EXTERNAL_USER ?= 1
+
+ifndef DOCKER_TAG
+    DOCKER_TAG := $(UNAME)-$(ARCH)
+endif
+
+# Auto-detect mount paths for internal scratch spaces
+ifneq ($(wildcard /home/scratch.mlperf_inference),)
+    DOCKER_MOUNTS += -v /home/scratch.mlperf_inference:/home/scratch.mlperf_inference
+endif
+ifneq ($(wildcard /home/scratch.svc_compute_arch),)
+    DOCKER_MOUNTS += -v /home/scratch.svc_compute_arch:/home/scratch.svc_compute_arch
+endif
+ifneq ($(wildcard /home/scratch.computelab/sudo),)
+    DOCKER_MOUNTS += -v /home/scratch.computelab/sudo:/home/scratch.computelab/sudo
+endif
+ifneq ($(wildcard /home/scratch.dlsim),)
+    DOCKER_MOUNTS += -v /home/scratch.dlsim:/home/scratch.dlsim
+endif
+ifneq ($(wildcard /raid/data),)
+    DOCKER_MOUNTS += -v /raid/data:/raid/data
+endif
+ifneq ($(wildcard /home/mlperf_inference_storage_01),)
+    DOCKER_MOUNTS += -v /home/mlperf_inference_storage_01:/home/mlperf_inference_storage_01
+endif
+ifneq ($(wildcard $(PROJECT_ROOT)/../../regression),)
+    DOCKER_MOUNTS += -v $(shell realpath $(PROJECT_ROOT)/../../regression):/regression
+endif
+ifdef MLPERF_SCRATCH_PATH
+    ifneq ($(wildcard $(MLPERF_SCRATCH_PATH)),)
+        DOCKER_MOUNTS += -v $(MLPERF_SCRATCH_PATH):$(MLPERF_SCRATCH_PATH)
+    else
+        $(error Path set in MLPERF_SCRATCH_PATH does not exist!)
+    endif
+endif
+
+# Docker environment variables forwarded into the container
+DOCKER_ENV_VAR += -e NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES}
+DOCKER_ENV_VAR += -e HISTFILE=/mnt/${HOME}/.mlperf_bash_history
+DOCKER_ENV_VAR += -e SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock
+DOCKER_ENV_VAR += -e MLPERF_SCRATCH_PATH=$(MLPERF_SCRATCH_PATH)
+DOCKER_ENV_VAR += -e HOST_HOSTNAME=$(shell hostname)
+ifdef CCACHE_DIR
+    DOCKER_MOUNTS += -v $(CCACHE_DIR):/home/$(UNAME)/.ccache
+    DOCKER_ENV_VAR += -e CCACHE_DIR=/home/$(UNAME)/.ccache
+endif
+
+# Detect nvidia-docker vs docker --runtime=nvidia
+ifneq ($(wildcard /usr/bin/nvidia-docker),)
+    DOCKER_RUN_CMD := nvidia-docker run
+    export DOCKER_API_VERSION=1.40
+else
+    DOCKER_RUN_CMD := docker run --runtime=nvidia
+endif
+
+# If DOCKER_COMMAND is specified, run detached (-d). Otherwise, run interactive (-it).
+ifeq ($(DOCKER_COMMAND),)
+    DOCKER_MODE_FLAGS = -it
+else
+    DOCKER_MODE_FLAGS = -d
+endif
+
+DOCKER_NAME := mlperf-inference-$(DOCKER_TAG)-$(shell bash -c 'echo $$RANDOM')
+
+
+############################## BASE IMAGE BUILDERS ##############################
+
+# Build DLRMv3 base Docker image (pulls cached or builds from source).
+build_dlrm_base: BASE_IMAGE ?= gitlab-master.nvidia.com/mlpinf/mlperf-inference/dlrm_images:dlrmv3-release-$(BUILD_CONTEXT)
+build_dlrm_base: MLPERF_IMAGE ?= mlperf-inference:$(DOCKER_TAG)-dlrm-latest
+.PHONY: build_dlrm_base
+build_dlrm_base:
+	@echo "BASE_IMAGE=$(BASE_IMAGE)"
+	@echo "MLPERF_IMAGE=$(MLPERF_IMAGE)"
+	@if docker pull $(BASE_IMAGE) 2>/dev/null; then \
+		echo "Using cached image: $(BASE_IMAGE)"; \
+	else \
+		echo "Building DLRMv3 image from source"; \
+		if [ "$(BUILD_CONTEXT)" = "aarch64-Grace" ]; then \
+			$(MAKE) -C src/nv_mlpinf/benchmarks/dlrm_v3 build_docker_graceblackwell DLRMV3_BASE_IMAGE=$(BASE_IMAGE) || { \
+				echo "Error: Failed to build DLRMv3 graceblackwell image"; \
+				exit 1; \
+			}; \
+		else \
+			$(MAKE) -C src/nv_mlpinf/benchmarks/dlrm_v3 build_docker_blackwell DLRMV3_BASE_IMAGE=$(BASE_IMAGE) || { \
+				echo "Error: Failed to build DLRMv3 image"; \
+				exit 1; \
+			}; \
+		fi; \
+	fi
+	@docker tag $(BASE_IMAGE) $(MLPERF_IMAGE)
+	@$(MAKE) -f Makefile.docker attach_docker MLPERF_IMAGE=$(MLPERF_IMAGE)
+
+
+############################## INTERACTIVE DOCKER SESSION ##############################
+# Image with user account added (used by attach_docker targets)
+MLPERF_USER_IMAGE ?= $(MLPERF_IMAGE)-user
+
+# Add current user into docker image (so mounted files are owned by host UID).
+.PHONY: docker_add_user
+docker_add_user:
+	@echo "Adding user account into image"
+	DOCKER_BUILDKIT=1 docker build -t $(MLPERF_USER_IMAGE) --network host \
+		--build-arg BASE_IMAGE=$(MLPERF_IMAGE) \
+		--build-arg GID=$(shell id -g) --build-arg UID=$(UID) --build-arg GROUP=$(shell id -gn) --build-arg USER=$(UNAME) \
+		- < docker/Dockerfile.user
+
+# Add user and launch an interactive container session.
+.PHONY: attach_docker
+attach_docker:
+	@$(MAKE) -f Makefile.docker docker_add_user
+	@$(MAKE) -f Makefile.docker launch_docker
+
+# Launch a container session (interactive or detached based on DOCKER_COMMAND).
+# If DOCKER_COMMAND is empty: interactive mode (-it)
+# If DOCKER_COMMAND is set (e.g., "sleep infinity"): detached mode (-d)
+.PHONY: launch_docker
+launch_docker:
+	@eval $$(ssh-agent -s) > /dev/null 2>&1 && \
+	$(DOCKER_RUN_CMD) --rm $(DOCKER_MODE_FLAGS) -w /work \
+		-v $(realpath ${PWD}):/work -v $(realpath ${HOME}):/mnt/${HOME} \
+		--cap-add SYS_ADMIN --cap-add SYS_TIME \
+		--shm-size=32gb \
+		--ulimit memlock=-1 \
+		-v $$SSH_AUTH_SOCK:/run/host-services/ssh-auth.sock \
+		-v /etc/timezone:/etc/timezone:ro -v /etc/localtime:/etc/localtime:ro \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		--security-opt apparmor=unconfined --security-opt seccomp=unconfined \
+		--name $(DOCKER_NAME) -h $(subst _,-,$(shell echo $(DOCKER_NAME) | cut -c -64)) --add-host $(subst _,-,$(DOCKER_NAME)):127.0.0.1 \
+		--cpuset-cpus $(shell taskset -c -p $$$$ | awk '{print $$NF}') \
+		--user $(UID) --net host --device /dev/fuse \
+		$(DOCKER_MOUNTS) $(DOCKER_ARGS) $(DOCKER_EXTRA_ARGS) \
+		$(DOCKER_ENV_VAR) \
+		$(shell if [ -n "$$MIG_CONF" ] && [ "$$MIG_CONF" = "ALL" ]; then echo "--gpus all -e NVIDIA_MIG_CONFIG_DEVICES=all"; elif [ -n "$$MIG_CONF" ] && [ "$$MIG_CONF" != "OFF" ]; then echo "--gpus '\"device=`bash scripts/mig_get_uuid.sh`\"'"; fi) \
+		$(MLPERF_USER_IMAGE) $(DOCKER_COMMAND)
+
+# Add user and launch a detached container session.
+# Usage: make attach_docker_detached DOCKER_COMMAND="sleep infinity"
+.PHONY: attach_docker_detached
+attach_docker_detached:
+	@$(MAKE) -f Makefile.docker docker_add_user
+	@$(MAKE) -f Makefile.docker launch_docker DOCKER_COMMAND="sleep infinity"
+
+# Launch an interactive session from a container image via Pyxis/Enroot (SLURM).
+# Usage: make launch_sqsh MLPERF_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc6
+.PHONY: launch_sqsh
+launch_sqsh:
+	@if [ -z "$(MLPERF_IMAGE)" ]; then \
+		echo "ERROR: MLPERF_IMAGE must be set to a container image or sqsh path"; \
+		exit 1; \
+	fi
+	unset LOG_DIR DATA_DIR PREPROCESSED_DATA_DIR MODEL_DIR && srun \
+		--container-image $(MLPERF_IMAGE) \
+		--container-mounts "$$(pwd):/work,/lustre/share/coreai_mlperf_inference/mlperf_inference_storage_clone:/home/mlperf_inference_storage" \
+		--container-workdir /work \
+		--container-remap-root \
+		--pty bash
+
+endif # ifndef MAKEFILE_DOCKER_INCLUDED

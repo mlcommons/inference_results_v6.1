@@ -1,0 +1,147 @@
+version: "0.1"
+
+variables:
+artifacts:
+  - name: CTX_URLS
+    uri: file://ctx_urls.txt
+    content: ""
+  - name: GEN_URLS
+    uri: file://gen_urls.txt
+    content: ""
+  - name: FRONTEND_URLS
+    uri: file://frontend_urls.txt
+    content: ""
+
+
+
+workflow:
+  name: trtllm_disagg
+  tasks:
+    - name: prefill_server
+      replicas:
+        count: ${{ variables.NUM_CTX_SERVERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_CTX_RANK }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.GPUS_PER_CTX_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_CTX_RANK, variables.GPUS_PER_NODE] | min }}
+      script:
+        # Register this replica's URL into CTX_URLS (plain ip:port, one per line)
+        - if [ "${SLURM_PROCID:-0}" = "0" ]; then echo "$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1):$(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX} ))" >> ${{ artifacts.CTX_URLS.path }}; fi
+        # Load env.yaml: print each export to stderr (logged), then eval to apply in current shell
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML_CTX }} | tee /dev/stderr)"
+        - >
+          trtllm-llmapi-launch
+          trtllm-serve ${{ variables.MODEL_PATH }}
+          --host 0.0.0.0
+          --port $(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX} ))
+          --extra_llm_api_options ${{ variables.TRTLLM_YAML_CTX }}
+          2>&1 | tee ${SFLOW_TASK_OUTPUT_DIR}/prefill_rank${SLURM_PROCID}.log
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 600
+          interval: 10
+
+    - name: decode_server
+      replicas:
+        count: ${{ variables.NUM_GEN_SERVERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_GEN_RANK }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.GPUS_PER_GEN_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_GEN_RANK, variables.GPUS_PER_NODE] | min }}
+      script:
+        # Register this replica's URL into GEN_URLS; port offset by NUM_CTX_SERVERS to avoid collision with ctx ports
+        - if [ "${SLURM_PROCID:-0}" = "0" ]; then echo "$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1):$(( ${{ variables.BASE_PORT }} + ${{ variables.NUM_CTX_SERVERS }} + ${SFLOW_REPLICA_INDEX} ))" >> ${{ artifacts.GEN_URLS.path }}; fi
+        # Load env.yaml: print each export to stderr (logged), then eval to apply in current shell
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML_GEN }} | tee /dev/stderr)"
+        - >
+          trtllm-llmapi-launch
+          trtllm-serve ${{ variables.MODEL_PATH }}
+          --host 0.0.0.0
+          --port $(( ${{ variables.BASE_PORT }} + ${{ variables.NUM_CTX_SERVERS }} + ${SFLOW_REPLICA_INDEX} ))
+          --extra_llm_api_options ${{ variables.TRTLLM_YAML_GEN }}
+          2>&1 | tee ${SFLOW_TASK_OUTPUT_DIR}/decode_rank${SLURM_PROCID}.log
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 600
+          interval: 10
+
+    # Each frontend replica reads all ctx/gen URLs, assembles its own server_config,
+    # then starts a trtllm-serve disaggregated endpoint on FRONTEND_PORT + replica_idx.
+    # All frontends share the same set of ctx/gen workers; the harness load-balances across them.
+    - name: frontend_server
+      replicas:
+        count: ${{ variables.NUM_FRONTEND_SERVERS }}
+        policy: parallel
+      resources:
+        nodes:
+          count: 1
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - FRONTEND_MY_PORT=$(( ${{ variables.FRONTEND_PORT }} + ${SFLOW_REPLICA_INDEX} ))
+        - MY_IP=$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1)
+        - MY_CONFIG=${SFLOW_TASK_OUTPUT_DIR}/server_config_${SFLOW_REPLICA_INDEX}.yaml
+        - CTX_URLS_LIST=$(grep -v '^[[:space:]]*$' ${{ artifacts.CTX_URLS.path }} | paste -sd ',')
+        - GEN_URLS_LIST=$(grep -v '^[[:space:]]*$' ${{ artifacts.GEN_URLS.path }} | paste -sd ',')
+        - >
+          python3 /work/scaleout/sflow/tools/generate_master_yaml.py
+          --hostname "${MY_IP}"
+          --port "${FRONTEND_MY_PORT}"
+          --ctx-urls "${CTX_URLS_LIST}"
+          --gen-urls "${GEN_URLS_LIST}"
+          --output "${MY_CONFIG}"
+          --register-url-to ${{ artifacts.FRONTEND_URLS.path }}
+        - trtllm-serve disaggregated -c "${MY_CONFIG}" --request_timeout 7200 --server_start_timeout 7200
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 120
+          interval: 10
+      depends_on:
+        - prefill_server
+        - decode_server
+
+    # Runs inference-endpoint against the (now-ready) frontend(s). Flattens the
+    # FRONTEND_URLS artifact (one ip:port per line, one per replica) into a
+    # comma-separated list, then renders a resolved endpoint.yaml whose
+    # endpoint_config.endpoints contains every frontend URL — the inference
+    # endpoint client load-balances across them.
+    - name: endpoint_benchmark
+      operator:
+        name: endpoint_sqsh
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        - set -euo pipefail
+        - FRONTEND_URLS_LIST=$(grep -v '^[[:space:]]*$' ${{ artifacts.FRONTEND_URLS.path }} | paste -sd ',')
+        - 'echo "FRONTEND_URLS_LIST=${FRONTEND_URLS_LIST}"'
+        - RESOLVED_ENDPOINT_YAML=${SFLOW_TASK_OUTPUT_DIR}/endpoint_resolved.yaml
+        - >
+          python3 /work/scaleout/sflow/tools/generate_endpoint_yaml.py
+          --input ${{ variables.ENDPOINT_CONFIG }}
+          --frontend-urls "${FRONTEND_URLS_LIST}"
+          --output "${RESOLVED_ENDPOINT_YAML}"
+        # Load endpoint env.yaml: print each export to stderr (logged), then eval to apply in current shell
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.ENDPOINT_ENV_YAML }} | tee /dev/stderr)"
+        - 'inference-endpoint benchmark from-config -c "${RESOLVED_ENDPOINT_YAML}"'
+      depends_on:
+        - frontend_server
+

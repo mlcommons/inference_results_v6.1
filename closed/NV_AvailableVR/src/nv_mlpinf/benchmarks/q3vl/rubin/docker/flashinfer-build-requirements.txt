@@ -1,0 +1,13 @@
+# Build-time requirements of the FlashInfer wheel builder (resolved together with FlashInfer's requirements.txt).
+# vLLM requirements/cuda.txt pins:
+apache-tvm-ffi==0.1.11
+nvidia-cutlass-dsl[cu13]==4.8.0
+# flashinfer-python build-system requires (pyproject.toml) and flashinfer-cubin's:
+setuptools==80.10.2
+packaging>=24.2
+wheel
+requests
+filelock
+tqdm
+numpy
+nvidia-ml-py

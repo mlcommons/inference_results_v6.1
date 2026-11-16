@@ -25,7 +25,10 @@ class BackendRegistry:
         CoreType.DUMMY: ('dummy', 'DummyCore'),
         CoreType.TRTLLM_EXECUTOR: ('trtllm_executor_core', 'TrtllmExecutorCore'),
         CoreType.TRTLLM_ENDPOINT: ('trtllm_endpoint_core', 'TrtllmEndpointCore'),
-        CoreType.DYNAMO_ENDPOINT: ('dynamo_endpoint_core', 'DynamoEndpointCore'),
+        # Dynamo needs no endpoint adapter: its frontend is OpenAI-compatible, so
+        # TrtllmEndpointCore drives it unchanged. Worker-registration readiness is
+        # gated by the workflow's wait_for_backends task, not by a core subclass.
+        CoreType.DYNAMO_ENDPOINT: ('trtllm_endpoint_core', 'TrtllmEndpointCore'),
     }
 
     @classmethod

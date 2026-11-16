@@ -1,21 +1,33 @@
 # DeepSeek-R1
 
+The Vera Rubin NVL72 submission (`VR-NVL72_VR-288GB_aarch64x72`) serves DeepSeek-R1 with TensorRT-LLM disaggregated
+prefill/decode workers behind NVIDIA Dynamo frontends, drives it with the MLPerf Endpoints client and orchestrates it
+with nv-sflow on Slurm + Enroot.
+
 ## Support Matrix
 
 See [Docker support](../../../../configs/DOCKER_SUPPORT.md) and [SLURM support](../../../../configs/SLURM_SUPPORT.md) for per-system, per-scenario support details.
 
 ## Getting Started
 
+Choose a directory on a filesystem that the Slurm login and compute nodes share. The model and the dataset go under
+it; every container mounts it at the same path. Clone this repository on a shared filesystem too: the workflow mounts
+`closed/NVIDIA` (`WORK_DIR`) into every container and runs its tools from there.
+
+```bash
+export SCRATCH_DIR=<shared directory>
+```
+
 ### Download Model
 
 Download the quantized FP4 checkpoint:
 
 ```bash
-export CHECKPOINT_PATH=build/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4
+export CHECKPOINT_PATH=${SCRATCH_DIR}/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4-v2
 git lfs install
 
 git clone https://huggingface.co/centml/DeepSeek-R1-NVFP4-v2-mlpinf ${CHECKPOINT_PATH}
-
+git -C ${CHECKPOINT_PATH} checkout 93947a0d7bd04f73ff98636f6b18ff5839e7aaf9
 ```
 
 #### Checkpoint provenance & reproduction
@@ -26,251 +38,142 @@ using its official `examples/deepseek` recipe: reshard to model-parallel-8,
 a single calibration sweep recording per-tensor activation `amax`
 (`NVFP4_DEFAULT_CFG`), then a one-shot FP8 → NVFP4 weight conversion. Scheme:
 MLP/MoE expert linears + `attn.wo` in NVFP4 (group-16 block scaling), MLA
-projections in bf16, KV cache in FP8.
+projections in bf16. The Vera Rubin configs store the MLA KV cache in 4 bits
+(`kv_cache_config.dtype: nvfp4` with the MXFP4-2D layout, `TRTLLM_FP4_MLA_MXFP4_2D=1`).
 
 This checkpoint was built with the **MLPerf deepseek-r1 calibration dataset**
 (500 samples). Exact Model-Optimizer/DeepSeek-V3 commit pins, the calibration
 override, and a runnable end-to-end script (`quantize_dsr1_mlperf_calib.py`) are
 documented in
 [`scripts/dsr1_nvfp4_ptq/`](../../../../scripts/dsr1_nvfp4_ptq/README.md).
-It clears the closed-division accuracy gate (exact_match 80.86 ≥ 80.5446).
 
 ### Download and Prepare Data
 
-Download dataset files following the MLCommons README:
+Download the evaluation dataset following the MLCommons README and convert it to the parquet file that the MLPerf
+Endpoints client reads (the same file serves the performance and the accuracy runs). Run it in the directory that holds
+the `.pkl`, with Python 3, `pandas` and `pyarrow` (`pip install pandas pyarrow`):
 
 ```bash
-# Download files from: https://github.com/mlcommons/inference/tree/master/language/deepseek-r1/README.md
+# Download from: https://github.com/mlcommons/inference/tree/master/language/deepseek-r1/README.md
 # - mlperf_deepseek_r1_dataset_4388_fp8_eval.pkl
-# - mlperf_deepseek_r1_calibration_dataset_500_fp8_eval.pkl
-
-# Move files to expected locations
-mv mlperf_deepseek_r1_dataset_4388_fp8_eval.pkl \
-    build/data/deepseek-r1/mlperf_deepseek_r1_dataset_4388_fp8_eval.pkl
-mv mlperf_deepseek_r1_calibration_dataset_500_fp8_eval.pkl \
-    build/data/deepseek-r1/mlperf_deepseek_r1_calibration_dataset_500_fp8_eval.pkl
-
-# Run preprocessing (inside container)
-make attach_docker MLPERF_IMAGE=nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86
-pip install -e ".[llm]"
-pip uninstall huggingface_hub
-BENCHMARKS=deepseek-r1 make preprocess_data
-
-# Note: If preprocessing fails, you may need numpy==2.3.0:
-# pip install virtualenv
-# virtualenv .venv --system-site-packages
-# source .venv/bin/activate
-# pip install numpy==2.3.0 torch==2.7.0
-# BENCHMARKS=deepseek-r1 make preprocess_data
+mkdir -p ${SCRATCH_DIR}/data/deepseek-r1-endpoints
+python3 - ${SCRATCH_DIR}/data/deepseek-r1-endpoints/deepseek_r1_eval.parquet <<'EOF'
+import sys
+import pandas as pd
+df = pd.read_pickle("mlperf_deepseek_r1_dataset_4388_fp8_eval.pkl")
+pd.DataFrame({"input_tokens": [list(map(int, t)) for t in df["tok_input"]], "ground_truth": df["ground_truth"],
+              "dataset": df["dataset"], "question": df["question"]}).to_parquet(sys.argv[1], index=False)
+EOF
 ```
 
 **Verify the following files exist:**
 
-1. Model: `build/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4/`
-2. Preprocessed data at `build/preprocessed_data/deepseek-r1/`:
-  - `input_lens.npy`
-  - `input_ids_padded.npy`
-  - `mlperf_deepseek_r1_calibration_dataset_500_fp8_calibration/data.parquet`
+1. Model: `${SCRATCH_DIR}/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4-v2/`
+2. Data: `${SCRATCH_DIR}/data/deepseek-r1-endpoints/deepseek_r1_eval.parquet` (4388 rows; the file used for the
+   results has sha256 `36facfae18f42587b7e4863e16a0e96446470761017d207791e609537d0f6f02`, which depends on the
+   pandas/pyarrow writer, so compare contents if it differs)
 
 ## Base Image
 
-DeepSeek-R1 uses the same TensorRT-LLM + nv-mlpinf container image for both the server and harness/client tasks. Use the x86 image for B200/B300 systems and the aarch64 image for GB200/GB300 systems.
-
-| System | Arch | Server image | Client image |
-| ------ | ---- | ------------ | ------------ |
-| B200-SXM-180GBx8, B300-SXM-270GBx8 | x86_64 | `nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86` | Same as server image |
-| GB200-NVL72, GB300-NVL72 (single node system or full rack system) | aarch64 | `nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_aarch64` | Same as server image |
-
-## Run the Benchmark in Single Node Using Docker
-
-This section covers all single-node Docker work: image pull, container start, performance, accuracy, and compliance. Check [Docker support](../../../../configs/DOCKER_SUPPORT.md) for the supported single-node systems.
-
-### Prepare the image for single node with Docker
-
-```bash
-docker pull nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86
-```
-
-### Start Docker and install `nv-mlpinf`
-
-```bash
-cd closed/NVIDIA
-make attach_docker MLPERF_IMAGE=nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86
-# make attach_docker MLPERF_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14
-# make attach_docker MLPERF_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20
-pip install -e ".[llm]"
-# pip uninstall huggingface_hub
-
-export MLPERF_SCRATCH_PATH=/work/build
-export SYSTEM_NAME=B200-SXM-180GBx8
-```
-
-### Offline performance and accuracy
-
-```bash
-nv-mlpinf run_llm_server --benchmarks=deepseek-r1 --scenarios=Offline
-
-# DISAMBIGUATION: repeat before EACH experiment:
-export LOG_DIR=/work/build/logs/deepseek_r1_$(date +%Y%m%d-%H%M%S) ; echo $LOG_DIR
-
-time nv-mlpinf run_harness --benchmarks=deepseek-r1 --scenarios=Offline --test_mode=AccuracyOnly
-
-# DISAMBIGUATION: repeat before EACH experiment:
-export LOG_DIR=/work/build/logs/deepseek_r1_$(date +%Y%m%d-%H%M%S) ; echo $LOG_DIR
-
-time nv-mlpinf run_harness --benchmarks=deepseek-r1 --scenarios=Offline --test_mode=PerformanceOnly
-```
-
-### Server performance and accuracy
-
-```bash
-nv-mlpinf run_llm_server --benchmarks=deepseek-r1 --scenarios=Server
-
-# DISAMBIGUATION: repeat before EACH experiment:
-export LOG_DIR=/work/build/logs/deepseek_r1_$(date +%Y%m%d-%H%M%S) ; echo $LOG_DIR
-
-time nv-mlpinf run_harness --benchmarks=deepseek-r1 --scenarios=Server --test_mode=AccuracyOnly
-
-# DISAMBIGUATION: repeat before EACH experiment:
-export LOG_DIR=/work/build/logs/deepseek_r1_$(date +%Y%m%d-%H%M%S) ; echo $LOG_DIR
-
-time nv-mlpinf run_harness --benchmarks=deepseek-r1 --scenarios=Server --test_mode=PerformanceOnly
-```
-
-Exit and re-enter the container to stop a running server before switching scenarios.
-
-### Single-node compliance
-
-DeepSeek-R1 uses `TEST06`. Run compliance in `PerformanceOnly` mode. Set `SCENARIO=Offline` or `SCENARIO=Server`.
-
-```bash
-SCENARIO=Offline
-nv-mlpinf run_llm_server --benchmarks=deepseek-r1 --scenarios=$SCENARIO
-make run_audit_test06 RUN_ARGS="--benchmarks=deepseek-r1 --scenarios=$SCENARIO --test_mode=PerformanceOnly"
-```
+| Task | Arch | Image |
+| ---- | ---- | ----- |
+| Server (TensorRT-LLM + NVIDIA Dynamo) | aarch64 | `registry.gitlab.com/nvidia/mlperf-inference-partner/nv-mlpinf-partner/v6.1-rubin-available-submission:DSR1-VR-NVL72-dsr1_26.08` |
+| MLPerf Endpoints client | aarch64 | `ghcr.io/mlcommons/endpoints:598dbfde` |
+| LiveCodeBench grader | aarch64 | `ghcr.io/mlcommons/endpoints:9d749906-livecodebench` |
 
 ## Run the Benchmark in Multi Node using Slurm + Enroot
 
-This section covers all multi-node SLURM work through `nv-sflow`: image access, performance, accuracy, and compliance. Check [SLURM support](../../../../configs/SLURM_SUPPORT.md) before choosing a system/scenario.
+This section covers the multi-node SLURM work through `nv-sflow`. Check [SLURM support](../../../../configs/SLURM_SUPPORT.md) before choosing a system/scenario.
 
-### Prepare the image for multi node with Slurm + Enroot
+Each scenario runs on one NVL72 rack: 18 nodes × 4 GPUs in one NVLink domain, allocated with `--segment=18`
+(set in `slurm_env_sflow.yaml`). Four 18-GPU prefill/decode pairs serve the model; all 72 GPUs are the system under
+test. The workflow pins the HBM clock to 4752 MHz on every node before the servers start (`MEM_CLOCK_MHZ`, needs
+passwordless `sudo nvidia-smi -lmc` on the compute nodes; add `--set MEM_CLOCK_MHZ=0` if the clocks are pinned
+otherwise), then runs the performance phase followed by the accuracy phase (`MODE=both`). The clocks are released
+after the client finishes; after a failed or cancelled job, run `sudo nvidia-smi -rmc` on its nodes.
 
-Do not build a `.sqsh` manually for the nv-sflow path. Each run pulls the container image from `variables.CONTAINER_IMAGE` in the selected `slurm_env_sflow.yaml`. For example, [configs/deepseek_r1/GB200-NVL72_GB200-186GB_aarch64x72/TRTLLM/Offline/slurm_env_sflow.yaml](../../../../configs/deepseek_r1/GB200-NVL72_GB200-186GB_aarch64x72/TRTLLM/Offline/slurm_env_sflow.yaml) points to:
+### Prepare the images for multi node with Slurm + Enroot
 
-```yaml
-variables:
-  CONTAINER_IMAGE:
-    value: "nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_aarch64"
+Import the prebuilt partner server, client, and grader images once on an aarch64 node. Configure Enroot registry
+authentication for `registry.gitlab.com` first; access to the partner project and `read_registry` permission are required.
+See the [partner release notes](../../../../../../release_notes/v6.1-rubin-available-submission.md) for setup and launch instructions.
+Source rebuilds are documented in [docker/vr-dsr1-trtllm-dynamo](../../../../docker/vr-dsr1-trtllm-dynamo/README.md).
+
+```bash
+mkdir -p ${SCRATCH_DIR}/images
+enroot import -o ${SCRATCH_DIR}/images/dsr1_rubin_trtllm_dynamo.sqsh \
+  'docker://registry.gitlab.com#nvidia/mlperf-inference-partner/nv-mlpinf-partner/v6.1-rubin-available-submission:DSR1-VR-NVL72-dsr1_26.08'
+enroot import -o ${SCRATCH_DIR}/images/endpoints_598dbfde.sqsh 'docker://ghcr.io#mlcommons/endpoints:598dbfde'
+enroot import -o ${SCRATCH_DIR}/images/endpoints_lcb.sqsh 'docker://ghcr.io#mlcommons/endpoints:9d749906-livecodebench'
 ```
 
-Confirm your SLURM compute nodes can pull that image through Pyxis/Enroot before launching a full run.
+### Install nv-sflow
+
+The commands below use nv-sflow `v0.3.1` on the login node; each job installs the same version on its compute nodes
+(`--sflow-version`), so the compute nodes need access to github.com.
+
+```bash
+python3 -m venv ${HOME}/sflow-venv
+source ${HOME}/sflow-venv/bin/activate
+pip install "sflow @ git+https://github.com/NVIDIA/nv-sflow.git@v0.3.1"
+```
 
 ### Common nv-sflow settings
 
-Run from `closed/NVIDIA`. Replace `ACCT`, `PARTITION`, and `SYSTEM` for your cluster and target system. The examples below use GB200x72.
+Run from `closed/NVIDIA`. Replace `ACCT`, `PARTITION` and the image paths for your cluster.
 
 ```bash
 ACCT=<your-slurm-account>
-PARTITION=gb200
-SYSTEM=GB200-NVL72_GB200-186GB_aarch64x72
+PARTITION=<your-partition>
+SYSTEM=VR-NVL72_VR-288GB_aarch64x72
 NODES=18
+SERVER_IMAGE=${SCRATCH_DIR}/images/dsr1_rubin_trtllm_dynamo.sqsh
+CLIENT_IMAGE=${SCRATCH_DIR}/images/endpoints_598dbfde.sqsh
+LCB_IMAGE=${SCRATCH_DIR}/images/endpoints_lcb.sqsh
+TEMPLATE=dynamo_disagg_rack18_endpoints_dsr1_perf_acc.yaml
 SFLOW_DUMP_DIR=build/sbatch_scripts_sflow
 mkdir -p "$SFLOW_DUMP_DIR"
 ```
 
-### Offline performance and accuracy
+### Offline, Server and Interactive performance and accuracy
 
-```bash
-TEST_MODE=PerformanceOnly  # use AccuracyOnly for accuracy
-RUN=deepseek_r1_${SYSTEM}_offline_${TEST_MODE}_$(date +%Y%m%d-%H%M%S)
-
-sflow batch \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/Offline/deepseek_config_sflow.yaml \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/Offline/slurm_env_sflow.yaml \
-  -f scaleout/sflow/templates/trtllm_ifb_loadgen.yaml \
-  --set WORK_DIR=$PWD \
-  --set TEST_MODE=$TEST_MODE \
-  --set SLURM_ACCOUNT=$ACCT \
-  --set SLURM_PARTITION=$PARTITION \
-  --nodes=$NODES \
-  --partition=$PARTITION \
-  --account=$ACCT \
-  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
-  --submit
-```
-
-### Server performance and accuracy
-
-```bash
-TEST_MODE=PerformanceOnly  # use AccuracyOnly for accuracy
-RUN=deepseek_r1_${SYSTEM}_server_${TEST_MODE}_$(date +%Y%m%d-%H%M%S)
-
-sflow batch \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/Server/deepseek_config_sflow.yaml \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/Server/slurm_env_sflow.yaml \
-  -f scaleout/sflow/templates/trtllm_ifb_loadgen.yaml \
-  --set WORK_DIR=$PWD \
-  --set TEST_MODE=$TEST_MODE \
-  --set SLURM_ACCOUNT=$ACCT \
-  --set SLURM_PARTITION=$PARTITION \
-  --nodes=$NODES \
-  --partition=$PARTITION \
-  --account=$ACCT \
-  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
-  --submit
-```
-
-### Interactive performance and accuracy
-
-Interactive uses disaggregated serving with the `trtllm_disagg_loadgen.yaml` disagg loadgen template.
-
-```bash
-TEST_MODE=PerformanceOnly  # use AccuracyOnly for accuracy
-RUN=deepseek_r1_${SYSTEM}_interactive_${TEST_MODE}_$(date +%Y%m%d-%H%M%S)
-
-sflow batch \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/Interactive/deepseek_config_sflow.yaml \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/Interactive/slurm_env_sflow.yaml \
-  -f scaleout/sflow/templates/trtllm_disagg_loadgen.yaml \
-  --set WORK_DIR=$PWD \
-  --set TEST_MODE=$TEST_MODE \
-  --set SLURM_ACCOUNT=$ACCT \
-  --set SLURM_PARTITION=$PARTITION \
-  --nodes=$NODES \
-  --partition=$PARTITION \
-  --account=$ACCT \
-  -o ${SFLOW_DUMP_DIR}/$RUN.sh \
-  --submit
-```
-
-### Multi-node compliance
-
-DeepSeek-R1 uses `TEST06`. Run compliance in `PerformanceOnly` mode by passing the audit test through `HARNESS_EXTRA_ARGS`. Set `SCENARIO=Offline`, `Server`, or `Interactive`; use `trtllm_ifb_loadgen.yaml` for Offline/Server and `trtllm_disagg_loadgen.yaml` for Interactive.
+Set `SCENARIO=Offline`, `Server` or `Interactive`:
 
 ```bash
 SCENARIO=Offline
-TEMPLATE=trtllm_ifb_loadgen.yaml
-# For Interactive, use:
-# SCENARIO=Interactive
-# TEMPLATE=trtllm_disagg_loadgen.yaml
-pip uninstall huggingface_hub
-RUN=deepseek_r1_${SYSTEM}_${SCENARIO}_TEST06_$(date +%Y%m%d-%H%M%S)
+RUN=deepseek_r1_${SYSTEM}_${SCENARIO}_$(date +%Y%m%d-%H%M%S)
 
 sflow batch \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/${SCENARIO}/deepseek_config_sflow.yaml \
-  -f configs/deepseek_r1/${SYSTEM}/TRTLLM/${SCENARIO}/slurm_env_sflow.yaml \
-  -f scaleout/sflow/templates/$TEMPLATE \
+  -f configs/deepseek_r1/${SYSTEM}/${SCENARIO}/deepseek_config_sflow.yaml \
+  -f configs/deepseek_r1/${SYSTEM}/${SCENARIO}/slurm_env_sflow.yaml \
+  -f scaleout/sflow/templates/${TEMPLATE} \
   --set WORK_DIR=$PWD \
-  --set TEST_MODE=PerformanceOnly \
-  --set HARNESS_EXTRA_ARGS="--audit_test=TEST06 --server_target_qps_adj_factor=0.92" \
+  --set SCRATCH_DIR=$SCRATCH_DIR \
+  --set CONTAINER_IMAGE=$SERVER_IMAGE \
+  --set ENDPOINT_CONTAINER_IMAGE=$CLIENT_IMAGE \
+  --set LCB_CONTAINER_IMAGE=$LCB_IMAGE \
   --set SLURM_ACCOUNT=$ACCT \
   --set SLURM_PARTITION=$PARTITION \
   --nodes=$NODES \
   --partition=$PARTITION \
   --account=$ACCT \
+  --time=02:30:00 \
+  --sflow-version v0.3.1 \
   -o ${SFLOW_DUMP_DIR}/$RUN.sh \
   --submit
 ```
+
+An Offline job takes about 1.5 hours, Server and Interactive about 1 hour. Add `--set MODE=perf` or `--set MODE=acc`
+to run one phase only. The client writes its report to `sflow_output/<job>/endpoint_benchmark/`:
+
+| File | Content |
+| --- | --- |
+| `config.yaml` | client configuration as run |
+| `performance/result_summary.json` | `tps`, TTFT / TPOT percentiles (`early_stopping_percentiles`), sample counts, duration |
+| `accuracy/accuracy_results.json` | `average_accuracy` (exact_match), output lengths |
+| `report.txt` | human-readable report |
+
+The throughput metric is `tps` (Server and Interactive: legacy LoadGen definition); tokens/s/GPU = `tps / 72`.
 
 ## Benchmark Passing Criteria
 
@@ -283,3 +186,6 @@ threshold; reduce target QPS and rerun if either latency metric fails.
 | Offline | `exact_match >= 0.99 * 81.3582 = 80.544618`; `TOKENS_PER_SAMPLE >= 0.9 * 3886.2274 = 3497.60466` | No TTFT/TPOT constraint |
 | Server | `exact_match >= 0.99 * 81.3582 = 80.544618`; `TOKENS_PER_SAMPLE >= 0.9 * 3886.2274 = 3497.60466` | TTFT <= 2 s; TPOT <= 80 ms |
 | Interactive | `exact_match >= 0.99 * 81.3582 = 80.544618`; `TOKENS_PER_SAMPLE >= 0.9 * 3886.2274 = 3497.60466` | TTFT <= 1.5 s; TPOT <= 15 ms |
+
+Every issued sample must complete (`n_samples_completed == n_samples_issued`, `n_samples_failed == 0` in
+`result_summary.json`).

@@ -1,0 +1,62 @@
+# inference-endpoint config - VR200-NVL72 Q3VL P/D disaggregated Interactive run.
+
+name: "interactive-qwen3-vl-235b-a22b-shopify-8k-benchmark"
+version: "1.0"
+type: "online"
+timeout: 14400
+
+submission_ref:
+  model: "qwen3-vl-235b-a22b"
+  ruleset: "mlperf-inference-v6.1"
+
+model_params:
+  name: "${MODEL_NAME}"
+  max_new_tokens: 150
+  streaming: "on"
+
+datasets:
+  - name: shopify_product_catalogue_8k::q3vl
+    type: "performance"
+  - name: shopify_product_catalogue_8k::q3vl
+    type: "accuracy"
+    accuracy_config:
+      eval_method: "shopify_category_f1"
+      ground_truth: "ground_truth_category"
+      extractor: "identity_extractor"
+      num_repeats: 1
+
+settings:
+  warmup:
+    enabled: true
+    n_requests: 7200
+    drain: true
+
+  runtime:
+    min_duration_ms: 600000
+    scheduler_random_seed: 42
+    dataloader_random_seed: 42
+
+  load_pattern:
+    type: "poisson"
+    target_qps: 1310
+
+  client:
+    num_workers: 8
+    transport:
+      type: zmq
+      recv_buffer_size: 16777216
+      send_buffer_size: 16777216
+    max_connections: 8192
+    worker_initialization_timeout: 120
+
+  drain:
+    warmup_timeout_s: 240.0
+    performance_timeout_s: null
+    accuracy_timeout_s: null
+
+endpoint_config:
+  endpoints:
+    - "${FRONTEND_URL:-http://localhost:8000}"
+  api_key: null
+
+report_dir: log_collection/result_collection/hecate/VR200/20260730-172002/qps_sweep/x72_interactive/single_candidate_qps1310_accuracy/attempt_1

@@ -1,0 +1,45 @@
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -557,6 +557,9 @@
+ # Build NIXL and its NIXL EP extension against the PyTorch installed here when
+ # requested. The wheels are installed by the final image, which has no compiler.
+ ARG BUILD_NIXL
++# UCX revision for the NIXL source build (the build script's default is the
++# moving branch v1.23.x); pass a commit to make the bundled UCX reproducible.
++ARG UCX_REF=v1.23.x
+ COPY tools/build_nixl_with_torch215_for_rubin.py /tmp/build_nixl_for_rubin.py
+ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+     set -eux; \
+@@ -566,6 +569,7 @@
+         dnf install -y --setopt=install_weak_deps=False autoconf automake libtool; \
+         dnf clean all; \
+         rm -rf /var/cache/dnf; \
++        UCX_REF="${UCX_REF}" \
+         NIXL_REQUIREMENTS_FILE=/tmp/vllm-requirements/kv_connectors.txt \
+         WHEELS_CACHE_HOME="${NIXL_WORKSPACE}/dist" \
+         MAX_JOBS="${max_jobs:-}" \
+@@ -939,8 +943,23 @@
+ # Install FlashInfer's precompiled kernels for all GPU architectures (the default).
+ # `vllm download-kernels` wraps this command but vLLM is only installed in later
+ # stages, and running it there would rebuild this large layer for every wheel.
++# FLASHINFER_LOCAL_WHEELS=1: requirements/rubin-prerelease.txt pins locally built
++# flashinfer-python + flashinfer-cubin wheels (a FlashInfer fork). There are no
++# public kernel wheels of that version, and installing the public ones would
++# replace the local flashinfer-cubin, so skip the download.
++ARG FLASHINFER_LOCAL_WHEELS=0
+ RUN --mount=type=cache,target=/opt/pip/cache \
+-    PIP_CACHE_DIR=/opt/pip/cache flashinfer download-kernels
++    --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
++    if [ "${FLASHINFER_LOCAL_WHEELS}" = "1" ]; then \
++        grep -q '^flashinfer-python @ file:///tmp/vllm-requirements/local-wheel-inputs/' \
++            /tmp/vllm-requirements/rubin-prerelease.txt \
++        && grep -q '^flashinfer-cubin @ file:///tmp/vllm-requirements/local-wheel-inputs/' \
++            /tmp/vllm-requirements/rubin-prerelease.txt \
++        && python3 -c "import importlib.metadata as m; a, b = m.version('flashinfer-python'), m.version('flashinfer-cubin'); assert a == b and '+' in a, (a, b); print('local FlashInfer wheels', a)" \
++        && echo "Skipping flashinfer download-kernels (local FlashInfer wheels)"; \
++    else \
++        PIP_CACHE_DIR=/opt/pip/cache flashinfer download-kernels; \
++    fi
+ 
+ # ============================================================
+ # OPENAI API SERVER DEPENDENCIES

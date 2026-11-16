@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Composed PTQ recipe: NVFP4 W4A4 on ALL linear layers (incl. attention q/k/v/o) with static
+# weight scales from an MSE FP8-scale sweep, dynamic NVFP4 inputs, and CALIBRATED FP8 KV-cache.
+# = "default" placement (everything NVFP4) + MSE weights + kv_fp8. Built from the proven
+# nvfp4_mlp_only_mse-kv_fp8_cast structure, broadened to '*' and switched to calibrated KV.
+
+imports:
+  base_disable_all: configs/ptq/units/base_disable_all
+  default_disabled_quantizers: configs/ptq/units/default_disabled_quantizers
+  nvfp4: configs/numerics/nvfp4
+  nvfp4_static: configs/numerics/nvfp4_static
+  kv_fp8: configs/ptq/units/kv_fp8
+
+metadata:
+  recipe_type: ptq
+  description: >-
+    Applies static NVFP4 weight scales from an MSE FP8-scale sweep and dynamic NVFP4 inputs to
+    all linear layers, plus calibrated FP8 KV-cache.
+quantize:
+  algorithm:
+    method: mse
+    fp8_scale_sweep: true
+    # layerwise.enable=false required for VLMs where the decoder layers are nested under
+    # `model.language_model.layers` (layerwise_calibrate can't find them otherwise).
+    layerwise:
+      enable: false
+  quant_cfg:
+    - $import: base_disable_all
+    - quantizer_name: '*weight_quantizer'
+      cfg:
+        $import: nvfp4_static
+    - quantizer_name: '*input_quantizer'
+      cfg:
+        $import: nvfp4
+    - $import: kv_fp8
+    - $import: default_disabled_quantizers

@@ -1,0 +1,7 @@
+{
+    "input_data_types": "fp32 + int32",
+    "retraining": "No",
+    "starting_weights_filename": "Huggingface model weights hosted by MLCommons (nvidia/Qwen3-VL-235B-A22B-Instruct-NVFP4-MLPerf-Inference-Closed-V6.1-FP8-KV)",
+    "weight_data_types": "fp4 + bf16",
+    "weight_transformations": "NVFP4 quantization of language-model linear weights, retaining BF16 unquantized tensors; calibrated FP8 KV cache. See src/nv_mlpinf/benchmarks/q3vl/vllm/scripts/quantization/README.md."
+}

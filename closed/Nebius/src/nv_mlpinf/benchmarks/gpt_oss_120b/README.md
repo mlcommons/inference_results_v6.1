@@ -116,8 +116,7 @@ GPT-OSS-120B uses the same TensorRT-LLM + nv-mlpinf container image for both the
 
 | System                                                            | Arch    | Server image                                                                                                            | Client image         |
 | ----------------------------------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| B200-SXM-180GBx8 | x86_64  | `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20` | Same as server image |
-| B300-SXM-270GBx8 | x86_64  | `nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86` | Same as server image |
+| B200-SXM-180GBx8, B300-SXM-270GBx8                                | x86_64  | `nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86`     | Same as server image |
 | GB200-NVL72, GB300-NVL72 (single node system or full rack system) | aarch64 | `nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_aarch64` | Same as server image |
 
 
@@ -127,11 +126,10 @@ This section covers all single-node Docker work: image pull, container start, pe
 
 ### Prepare the image for single node with Docker
 
-Use the docker image from the table above for single-node Docker systems.
+Use the x86 public MLPerf TensorRT-LLM image for single-node Docker systems such as B200/B300.
 
 ```bash
-export DOCKER_IMAGE=...
-docker pull $DOCKER_IMAGE
+docker pull nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86
 ```
 
 ### Start Docker and install `nv-mlpinf`
@@ -140,11 +138,6 @@ docker pull $DOCKER_IMAGE
 cd closed/NVIDIA
 make attach_docker MLPERF_IMAGE=nvcr.io/nvidia/mlperf/mlperf-inference:tensorrt_llm_release-feat-1.2-mlpinf-b5ddff4_mlperf-main-f538816_jan28_x86
 pip install -e ".[llm]"
-```
-
-If using the `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20` image, also run
-```bash
-pip uninstall huggingface_hub
 ```
 
 ### Test mode selection

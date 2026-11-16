@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1
+
+FROM nvcr.io/nvidia/pytorch:25.06-py3
+
+RUN [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
+
+
+
+RUN apt-get update
+RUN apt-get -y install sudo openssh-client git
+RUN pip uninstall -y torch torchvision
+RUN pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
+
+# Set as environment variable (persists in the container)
+
+# RUN pip install fbgemm-gpu==1.3.0+cpu --index-url https://download.pytorch.org/whl/cpu/
+
+ARG FBGEMM_VERSION=v1.3.0
+ENV FBGEMM_VERSION=${FBGEMM_VERSION}
+RUN git clone --recursive -b ${FBGEMM_VERSION} https://github.com/pytorch/FBGEMM.git fbgemm_${FBGEMM_VERSION} && cd fbgemm_${FBGEMM_VERSION}/fbgemm_gpu && pip install -r requirements.txt
+RUN cd fbgemm_${FBGEMM_VERSION}/fbgemm_gpu && python setup.py clean
+# Fix gitversion compatibility issue: version_from_git() now returns a Version object, not a string
+# Combined with install to ensure cache invalidation
+RUN sed -i 's/gitversion\.version_from_git()\.split/str(gitversion.version_from_git()).split/g' fbgemm_${FBGEMM_VERSION}/fbgemm_gpu/setup.py && \
+    export package_name=fbgemm_gpu && \
+    export python_tag=py313 && \
+    export ARCH=$(uname -m) && \
+    export python_plat_name="manylinux_2_28_${ARCH}" && \
+    cd fbgemm_${FBGEMM_VERSION}/fbgemm_gpu && \
+    python setup.py install \
+    --build-variant=cuda \
+    --build-target=default \
+    --package_channel=release
+RUN pip install torchrec==1.3.0 --extra-index-url https://download.pytorch.org/whl/torchrec/
+
+
+RUN pip install mpi4py==4.1.1
+# # GR repo
+WORKDIR /opt
+RUN git clone https://github.com/meta-recsys/generative-recommenders.git && cd generative-recommenders \
+&& git checkout 0992f3f84777cecb61d76991b097bbf88b13bc20 
+RUN cd generative-recommenders && pip install -e .
+
+
+
+# loadgen - clone and build static library + wheel
+RUN git clone https://github.com/mlcommons/inference.git -b master && cd inference && \
+    git checkout 4757cd1dceda84918cfa7b9c2650a3febd10786d
+RUN cd /opt/inference/loadgen && mkdir -p build && cd build && \
+    cmake -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j
+RUN cd /opt/inference/loadgen && \
+    CFLAGS="-std=c++14 -O3" pip wheel . && \
+    pip install --force-reinstall mlcommons_loadgen*.whl && \
+    rm -f mlcommons_loadgen*.whl
+
+
+# Build ffi_utils
+COPY inference_harness/tools/ffi_utils /opt/ffi_utils
+RUN cd /opt/ffi_utils && mkdir -p build && cd build && cmake .. && make -j
+
+# embedding op
+RUN git clone https://github.com/NVIDIA/nv-embedding-cache.git /opt/trt-recsys && cd /opt/trt-recsys && git checkout 95312e806da34eeae5eba73e1deec564171abc46 && git submodule update --init --recursive 
+RUN cd /opt/trt-recsys && pip install .
+
+# cute dsl HSTU op
+RUN pip install nvidia-cutlass-dsl
+RUN git clone https://github.com/jiayus-nvidia/FBGEMM.git -b blackwell_dev && cd FBGEMM && git checkout 109c4ac1b3c3b8c07e2c779cf247903787b7cb19
+RUN touch /opt/FBGEMM/fbgemm_gpu/experimental/__init__.py && touch /opt/FBGEMM/fbgemm_gpu/experimental/hstu/__init__.py
+
+WORKDIR /workspace
+RUN rm -rf /workspace/fbgemm_${FBGEMM_VERSION}

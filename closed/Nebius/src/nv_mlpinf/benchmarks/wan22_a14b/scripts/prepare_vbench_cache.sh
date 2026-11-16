@@ -19,10 +19,20 @@
 #   HOME=/work/build/vbench_cache/home                 (CLIP -> $HOME/.cache/clip)
 # This script populates all three subtrees so those paths resolve offline.
 #
-# Usage: prepare_vbench_cache.sh [CACHE_DIR]   (default: build/vbench_cache)
+# The scene dim ALSO needs bert-base-uncased (Tag2Text's init_tokenizer() loads a
+# BertTokenizer AND BertModel weights). VBench reads that from the HF hub cache that
+# endpoint_env_vbench.yaml points at (HF_HUB_CACHE=<scratch>/.hf_cache/hub) -- a
+# DIFFERENT location than build/vbench_cache -- so it is staged there too (below).
+# Without it, offline runs fail: first "Can't load tokenizer for 'bert-base-uncased'",
+# then "does not appear to have a file named pytorch_model.bin".
+#
+# Usage: prepare_vbench_cache.sh [CACHE_DIR] [HF_CACHE_DIR]
+#   CACHE_DIR    default: build/vbench_cache
+#   HF_CACHE_DIR default: ${MLPERF_SCRATCH_PATH}/models/wan22-a14b/.hf_cache/hub
 set -euo pipefail
 
 CACHE_DIR=${1:-build/vbench_cache}
+HF_CACHE_DIR=${2:-${MLPERF_SCRATCH_PATH:-/lustre/share/coreai_mlperf_inference/mlperf_inference_storage_clone}/models/wan22-a14b/.hf_cache/hub}
 mkdir -p "$CACHE_DIR"/{amt_model,raft_model,caption_model,torch_home/hub/checkpoints,home/.cache/clip}
 cd "$CACHE_DIR"
 
@@ -43,6 +53,17 @@ fi
 # scene — Tag2Text checkpoint
 dl https://huggingface.co/spaces/xinyu1205/recognize-anything/resolve/main/tag2text_swin_14m.pth \
    caption_model/tag2text_swin_14m.pth
+# scene (cont.) — bert-base-uncased tokenizer + BertModel weights, staged into the HF
+# hub-cache layout that VBench reads offline (HF_HUB_CACHE, on the scratch mount --
+# NOT under CACHE_DIR). SHA-pinned resolve URLs keep the snapshot dir name and the
+# downloaded file provenance in sync (plain `curl -fsSL` follows the LFS redirect).
+BERT_SHA=86b5e0934494bd15c9632b12f734a8a67f723594  # bert-base-uncased pinned commit
+BERT_SNAP="$HF_CACHE_DIR/models--bert-base-uncased/snapshots/$BERT_SHA"
+mkdir -p "$BERT_SNAP" "$HF_CACHE_DIR/models--bert-base-uncased/refs"
+printf '%s' "$BERT_SHA" > "$HF_CACHE_DIR/models--bert-base-uncased/refs/main"
+for _bf in config.json vocab.txt tokenizer_config.json tokenizer.json pytorch_model.bin; do
+    dl "https://huggingface.co/bert-base-uncased/resolve/$BERT_SHA/$_bf" "$BERT_SNAP/$_bf"
+done
 
 echo "== subject_consistency — DINO (torch.hub github checkout + weights) =="
 # VBench (local=False) calls torch.hub.load('facebookresearch/dino:main',
@@ -63,3 +84,5 @@ dl "https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a
 
 echo "VBench cache ready at $(pwd):"
 du -sh amt_model raft_model caption_model torch_home home 2>/dev/null || true
+echo "bert-base-uncased (scene) staged at $HF_CACHE_DIR/models--bert-base-uncased:"
+du -sh "$HF_CACHE_DIR/models--bert-base-uncased" 2>/dev/null || true

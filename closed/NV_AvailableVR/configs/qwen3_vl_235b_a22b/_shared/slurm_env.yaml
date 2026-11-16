@@ -1,0 +1,100 @@
+# Shared slurm + container environment for q3vl v6.1 sflow submissions.
+# Per-submission slurm_envs may layer on top of this to override defaults.
+
+variables:
+  CONTAINER_IMAGE:
+    description: "Backend (server) container image. Accepts a Docker URL or an absolute Enroot .sqsh path."
+    value: "docker://gitlab-master.nvidia.com/mlpinf/mlperf-inference/mlperf-inf-mm-q3vl-nv:arm64_cuda13.0.1_CentML_dynamo-mlperf-inf-mm-q3vl-v6.1_CentML_vllm-mlperf-inf-mm-q3vl-v6.1"
+  BACKEND_CONTAINER_NAME:
+    description: "Pyxis/Enroot name for the backend container imported by load_image and reused by backend tasks. Defaults to CONTAINER_IMAGE with URL/path punctuation replaced by dashes. Override when running concurrent q3vl jobs as the same user."
+    value: "${{ variables.CONTAINER_IMAGE.replace('://', '-').replace('/', '-').replace(':', '-').replace('@', '-').replace('.', '-') }}"
+  ENDPOINT_CONTAINER_IMAGE:
+    description: "Frontend (endpoints client) container image."
+    value: "ghcr.io/mlcommons/endpoints:598dbfde68ebfa42256762ebb60fd4da227b813c@sha256:de854e3f913cbb0fd6f6b8e75c8fd817c08cc4971303302514cbaa132aa5b9c2"
+
+  WORK_DIR:
+    description: "REQUIRED. Host path containing the q3vl sflow YAML + tools (pass via --set); bind-mounted at /work."
+    value: ""
+  HF_CACHE_HOST_DIR:
+    description: "Optional. Host HuggingFace cache. If set, bind-mounted at `/root/.cache/huggingface`. Otherwise the workflow uses `$(pwd)/.cache/huggingface`, which is shared by the `WORK_DIR` mount."
+    value: ""
+  HF_CACHE_CONTAINER_DIR:
+    description: "Container path used for HF_HOME/HF_HUB_CACHE."
+    value: "${{ '/root/.cache/huggingface' if variables.HF_CACHE_HOST_DIR else '/work/.cache/huggingface' }}"
+
+  CONTAINER_MOUNTS:
+    description: "Comma-separated host:container mount paths. WORK_DIR is always mounted; HF_CACHE_HOST_DIR is additionally mounted when set."
+    value: "${{ variables.WORK_DIR }}:/work${{ ',' + variables.HF_CACHE_HOST_DIR + ':/root/.cache/huggingface' if variables.HF_CACHE_HOST_DIR else '' }}"
+
+  SLURM_ACCOUNT:
+    description: "REQUIRED. Slurm account to charge the job to (pass via --set SLURM_ACCOUNT=<your-account>)."
+    value: ""
+  SLURM_PARTITION:
+    value: "gb300"
+  SLURM_TIME:
+    value: "04:00:00"
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+
+operators:
+  # ENROOT_TRANSFER_RETRIES + _CONNECT_TIMEOUT: when N workers fan out, pyxis
+  # re-queries the registry on each container start, and gitlab-master can
+  # return transient `curl: (52) Empty reply` on one or two of them.
+  - name: test_container
+    type: srun
+    container_writable: false
+    container_mount_home: false
+    container_remap_root: true
+    mpi: pmix
+    container_mounts:
+      - ${{ variables.CONTAINER_MOUNTS }}
+    container_workdir: /work
+    export: "ALL,ENROOT_TRANSFER_RETRIES=3,ENROOT_CONNECT_TIMEOUT=60"
+    extra_args:
+      - --container-image=${{ variables.CONTAINER_IMAGE }}
+      - --container-name=${{ variables.BACKEND_CONTAINER_NAME }}
+
+  - name: frontend_container
+    type: srun
+    container_writable: false
+    container_mount_home: false
+    container_remap_root: true
+    mpi: pmix
+    container_mounts:
+      - ${{ variables.CONTAINER_MOUNTS }}
+    container_workdir: /work
+    export: "ALL,ENROOT_TRANSFER_RETRIES=3,ENROOT_CONNECT_TIMEOUT=60"
+    extra_args:
+      - --container-image=${{ variables.CONTAINER_IMAGE }}
+      - --container-name=${{ variables.BACKEND_CONTAINER_NAME }}
+      - --cpus-per-task=64
+      - --cpu-bind=none
+      - --overlap
+
+  - name: endpoint_sqsh
+    type: srun
+    container_writable: false
+    container_mount_home: false
+    container_remap_root: true
+    container_mounts:
+      - ${{ variables.CONTAINER_MOUNTS }}
+    container_workdir: /work
+    export: "ALL,ENROOT_TRANSFER_RETRIES=3,ENROOT_CONNECT_TIMEOUT=60"
+    extra_args:
+      - --container-image=${{ variables.ENDPOINT_CONTAINER_IMAGE }}
+      - --cpus-per-task=16
+      - --cpu-bind=none
+      - --overlap
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: ${{ ((variables.TOTAL_GPUS / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+    extra_args:
+      - "--exclusive"

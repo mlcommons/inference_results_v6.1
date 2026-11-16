@@ -245,7 +245,12 @@ class DeepSeek_R1AccuracyChecker(AccuracyChecker):
         logging.info("Patching PRM800k setup.py to remove the 'import numpy' line...")
         prm800k_setup_py = paths.MLCOMMONS_INF_REPO / "language" / "deepseek-r1" / "submodules" / "prm800k" / "setup.py"
         if not prm800k_setup_py.exists():
-            raise FileNotFoundError(f"PRM800k setup.py not found at {prm800k_setup_py}, please run `make clone_loadgen` first.")
+            raise FileNotFoundError(
+                f"PRM800k setup.py not found at {prm800k_setup_py}. It is a NESTED submodule of "
+                "3rdparty/mlc-inference, so a non-recursive submodule checkout (GitLab's default, "
+                "GIT_SUBMODULE_STRATEGY=normal) leaves it empty. Init just this path with:\n"
+                "    git -C 3rdparty/mlc-inference submodule update --init --depth 1 -- "
+                "language/deepseek-r1/submodules/prm800k")
 
         with open(prm800k_setup_py, "r") as f:
             lines = f.readlines()

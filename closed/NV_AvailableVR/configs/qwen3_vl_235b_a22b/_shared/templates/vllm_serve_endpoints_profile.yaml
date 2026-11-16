@@ -1,0 +1,181 @@
+# vLLM serve + endpoints PROFILING workflow (single node).
+#
+# Minimal 2-component deployment for Nsight Systems profiling:
+#   1) vllm_server      - one `vllm serve` (OpenAI HTTP) spanning all GPUs on the
+#                         node, launched UNDER `nsys profile` with vLLM's cuda
+#                         profiler enabled. No etcd/NATS/dynamo.frontend.
+#   2) endpoint_benchmark - the inference-endpoint client; profiling is enabled in
+#                         endpoint.yaml (settings.profiling.engine: vllm), which POSTs
+#                         /start_profile at perf-phase start and /stop_profile at end.
+# Plus a teardown task that signals nsys to stop + flush the .nsys-rep:
+#   3) stop_server      - touches a shared sentinel after the benchmark; the
+#                         server task is waiting on it, then SIGINTs nsys so it
+#                         finalizes the report and exits.
+#
+# All run artifacts (vllm_serve.log, .nsys-rep, client log, PROFILE_DONE sentinel)
+# live under /work/profile_out/$(basename $SFLOW_WORKFLOW_OUTPUT_DIR)/ — i.e. inside
+# the WORK_DIR bind mount — so the tasks only need the /work mount and never depend
+# on the host output dirs being visible in the container. sflow resolves
+# SFLOW_WORKFLOW_OUTPUT_DIR (<jobid>-<workflow>-<timestamp>-<hash>) once per run,
+# before either task starts, and exports the same value to both srun steps — unique
+# per run (even for repeat runs inside one salloc) with no manual tagging.
+# Host location: <WORK_DIR>/profile_out/<jobid>-vllm_serve_endpoints_profile-<ts>-<hash>/.
+#
+# capture-range-end=stop (NOT stop-shutdown) so the benchmark finishes cleanly;
+# the explicit teardown flushes the trace. Per-scenario qwen3vl_config.yaml fills
+# MODEL_REPO_ID / VLLM_FLAGS / ENDPOINT_CONFIG / WORKER_ENV_YAML / NSYS_ARGS.
+
+version: "0.1"
+
+variables:
+  TOTAL_GPUS:
+    description: "GPUs the single vllm serve instance spans (= --tensor-parallel-size)."
+    type: integer
+    value: 4
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+  NUM_NODES:
+    description: "Single node only — vllm serve is one instance."
+    type: integer
+    value: 1
+
+  WORKFLOW_TIMEOUT:
+    description: "Last-resort wall-clock cap (< slurm walltime). Normal teardown is the
+      endpoint_benchmark EXIT trap; this only bounds a hard-kill / node stall."
+    value: "30m"
+  READINESS_TIMEOUT:
+    type: integer
+    value: 3600
+
+  MODEL_REPO_ID:
+    description: "HuggingFace repo id passed to `vllm serve <model>`."
+    value: ""
+  MODEL_REVISION:
+    value: "main"
+  HF_TOKEN:
+    value: ""
+
+  VLLM_FLAGS:
+    description: "Full --... flag string for `vllm serve` (incl. --profiler-config JSON)."
+    value: ""
+  WORKER_ENV_YAML:
+    description: "Path (in container) to a flat KEY: value YAML of server env vars."
+    value: ""
+
+  NSYS_ARGS:
+    description: "nsys profile prefix (everything before -o / the target command)."
+    value: >-
+      nsys profile --wait primary -f true
+      --gpu-metrics-devices=all --trace-fork-before-exec=true --cuda-graph-trace=node
+      --capture-range=cudaProfilerApi --capture-range-end=stop --trace cuda,nvtx
+  NSYS_OUTPUT:
+    description: "Basename of the .nsys-rep (written under the run's vllm_server dir)."
+    value: "server_test"
+
+  SERVED_PORT:
+    type: integer
+    value: 8000
+
+  ENDPOINT_CONFIG:
+    description: "Path (in container) to the inference-endpoint benchmark config yaml."
+    value: ""
+
+workflow:
+  name: vllm_serve_endpoints_profile
+  timeout: ${{ variables.WORKFLOW_TIMEOUT }}
+  variables:
+    HEAD_NODE_IP:
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+    SERVER_URL:
+      value: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:${{ variables.SERVED_PORT }}"
+
+  tasks:
+    - name: vllm_server
+      resources:
+        nodes:
+          indices: [0]
+        gpus:
+          count: ${{ variables.TOTAL_GPUS }}
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - 'if [ -n "${{ variables.HF_TOKEN }}" ]; then export HF_TOKEN=${{ variables.HF_TOKEN }}; fi'
+        # Load server env vars (flashinfer, NVTX-for-profiling, etc.).
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.WORKER_ENV_YAML }} | tee /dev/stderr)"
+        # Run artifact dir under the /work mount (see header). SHARED holds the
+        # sentinel; TASK_DIR holds this task's log + the .nsys-rep. The basename of
+        # SFLOW_WORKFLOW_OUTPUT_DIR is sflow's per-run unique id, identical in both tasks.
+        - SHARED=/work/profile_out/$(basename ${SFLOW_WORKFLOW_OUTPUT_DIR}); TASK_DIR=${SHARED}/vllm_server; mkdir -p ${TASK_DIR}; rm -f ${SHARED}/PROFILE_DONE
+        # NUMA-pin to the (first) GPU's local domain, matching the Server/Offline
+        # dynamo.vllm worker recipe (numactl via get_gpu_numa.py).
+        - NUMA_NODE=$(python3 /work/scaleout/sflow/tools/get_gpu_numa.py)
+        - 'echo "[vllm_server] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NUMA_NODE=$NUMA_NODE TASK_DIR=$TASK_DIR"'
+        - >
+          numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE}
+          ${{ variables.NSYS_ARGS }}
+          -o ${TASK_DIR}/${{ variables.NSYS_OUTPUT }}
+          vllm serve ${{ variables.MODEL_REPO_ID }}
+          --revision ${{ variables.MODEL_REVISION }}
+          --host 0.0.0.0 --port ${{ variables.SERVED_PORT }}
+          ${{ variables.VLLM_FLAGS }}
+          > ${TASK_DIR}/vllm_serve.log 2>&1 &
+        - NSYS_PID=$!
+        # Mirror the server log to this task's stdout so sflow's log_watch probes
+        # see it (and it shows in sflow.log). Backgrounding nsys directly (not via
+        # a pipe) keeps NSYS_PID = nsys for a clean SIGINT below.
+        - touch ${TASK_DIR}/vllm_serve.log; tail -n +1 -F ${TASK_DIR}/vllm_serve.log & TAIL_PID=$!
+        - 'echo "[vllm_server] nsys pid=$NSYS_PID; waiting for ${SHARED}/PROFILE_DONE"'
+        # Stay alive until the teardown signals (or nsys dies early).
+        - |
+          while [ ! -f "${SHARED}/PROFILE_DONE" ]; do
+            if ! kill -0 "$NSYS_PID" 2>/dev/null; then
+              echo "[vllm_server] nsys exited before teardown signal" >&2; break
+            fi
+            sleep 5
+          done
+        - 'echo "[vllm_server] flushing nsys report (SIGINT)"; kill -INT "$NSYS_PID" 2>/dev/null || true'
+        - wait "$NSYS_PID" 2>/dev/null || true
+        - kill "$TAIL_PID" 2>/dev/null || true
+        - 'echo "[vllm_server] done; report at ${TASK_DIR}/${{ variables.NSYS_OUTPUT }}.nsys-rep"'
+      probes:
+        readiness:
+          http_get:
+            url: "${{ variables.SERVER_URL }}/health"
+          timeout: ${{ variables.READINESS_TIMEOUT }}
+          interval: 5
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 3
+          interval: 30
+
+    - name: endpoint_benchmark
+      operator:
+        name: endpoint_sqsh
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        - set -euo pipefail
+        # Same run dir as vllm_server (SFLOW_WORKFLOW_OUTPUT_DIR is resolved once by
+        # sflow before either task starts and exported identically to both).
+        - SHARED=/work/profile_out/$(basename ${SFLOW_WORKFLOW_OUTPUT_DIR}); TASK_DIR=${SHARED}/endpoint_benchmark; mkdir -p ${TASK_DIR}
+        # Signal vllm_server to flush nsys + exit on ANY exit of this task
+        # (success OR failure), so the server never waits out WORKFLOW_TIMEOUT.
+        # The client fires /stop_profile (cudaProfilerStop) before it exits, so by
+        # the time this trap runs the capture range is already closed.
+        - trap 'touch ${SHARED}/PROFILE_DONE' EXIT
+        - export FRONTEND_URL=${{ variables.SERVER_URL }}
+        - export MODEL_NAME=${{ variables.MODEL_REPO_ID }}
+        - 'echo "[endpoint] FRONTEND_URL=$FRONTEND_URL  MODEL_NAME=$MODEL_NAME  CONFIG=${{ variables.ENDPOINT_CONFIG }}  TASK_DIR=$TASK_DIR"'
+        - >
+          /opt/venv/bin/inference-endpoint benchmark from-config
+          -c ${{ variables.ENDPOINT_CONFIG }}
+          2>&1 | tee ${TASK_DIR}/inference_endpoint.log
+      depends_on:
+        - vllm_server

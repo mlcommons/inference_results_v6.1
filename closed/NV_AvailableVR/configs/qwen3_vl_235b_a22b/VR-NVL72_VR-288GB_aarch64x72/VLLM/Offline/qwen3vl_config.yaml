@@ -1,0 +1,70 @@
+# Qwen3-VL — VR-NVL72 Offline perf run (18 nodes × 4 GPUs).
+
+variables:
+  TOTAL_GPUS:
+    type: integer
+    value: 72
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+  GPUS_PER_WORKER:
+    description: "TP × PP × DP = 1 × 1 × 1. Must match the corresponding flags in VLLM_FLAGS."
+    type: integer
+    value: 1
+
+  WORKFLOW_TIMEOUT:
+    value: "230m"
+
+  # Memclk: pin DRAM to max (MEMCLK_PIN_MHZ) for the whole run -> ~+4-5% where bandwidth-bound.
+  # The 18-node job runs without a node-type constraint (submit with -e '--segment=1'), so the
+  # allocation can include 'cr' nodes, which reject the lock (-lmc). '[memclk pinned]' in the
+  # log means the clocks read the target, not a verified lock.
+  ENABLE_MEMCLK_PIN:
+    value: "1"
+
+  MODEL_REPO_ID:
+    value: "nvidia/Qwen3-VL-235B-A22B-Instruct-NVFP4-MLPerf-Inference-Closed-V6.1-FP8-KV"
+
+  ENDPOINT_CONFIG:
+    value: "/work/configs/qwen3_vl_235b_a22b/VR-NVL72_VR-288GB_aarch64x72/VLLM/Offline/endpoint.yaml"
+
+  WORKER_ENV_YAML:
+    value: "/work/configs/qwen3_vl_235b_a22b/VR-NVL72_VR-288GB_aarch64x72/VLLM/Offline/worker_env.yaml"
+
+
+  # Built from public sources with the pins of
+  # src/nv_mlpinf/benchmarks/q3vl/rubin/scripts/build_image.sh (see rubin/README.md):
+  # vLLM + FlashInfer q3vl-release-parity, with the tuned Rubin FMHA exports in FlashInfer's
+  # pinned cubin collection (no FLASHINFER_DSL_FMHA_LOCAL_DIR). Pinned by digest.
+  CONTAINER_IMAGE:
+    value: "gitlab-master.nvidia.com:5005/mlpinf/mlperf-inference/mlperf-inf-mm-q3vl-nv:arm64_cuda134_q3vlpublic_202610272018@sha256:768f0b37f404e14c177cf386b824ab5ce864dccca2a283bc17ef7e175172cfb6"
+
+  # cudagraph_capture_sizes (in --compilation-config): 1, 2, 4, every 8 to 256, every 16 to 512 and
+  # every 64 to 21504 (379 sizes), then every 256 from 21760 to 26624 (399 sizes). Above 21504 the
+  # step is 256: a denser list (every 64, 459 sizes) fails CUDA-graph capture with
+  # CUDA_ERROR_OUT_OF_MEMORY on this image.
+  VLLM_FLAGS:
+    value: >-
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --data-parallel-size 1
+      --async-scheduling
+      --max-model-len 32768
+      --max-num-seqs 512
+      --max-num-batched-tokens 26624
+      --mm-encoder-attn-backend FLASHINFER
+      --override-generation-config '{"max_new_tokens": 150}'
+      --limit-mm-per-prompt.video 0
+      --no-enable-prefix-caching
+      --enable-multimodal
+      --kv-events-config '{"publisher":"null"}'
+      --mm-processor-cache-gb 0
+      --mm-encoder-attn-dtype=fp8
+      --mm-encoder-fp8-scale-path=/work/configs/qwen3_vl_235b_a22b/_shared/vit_fp8_scales_all1.json
+      --enable-flashinfer-autotune
+      --moe-backend flashinfer_cutedsl
+      --scheduling-policy priority
+      --compilation-config '{"compile_mm_encoder":true,"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true,"fuse_attn_quant":true},"use_inductor_graph_partition":true,"inductor_compile_config":{"max_autotune":true,"coordinate_descent_tuning":true},"cudagraph_mm_encoder":"true","encoder_cudagraph_token_budgets":[1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384],"encoder_cudagraph_max_vision_items_per_batch":16,"encoder_cudagraph_max_frames_per_batch":16,"max_cudagraph_capture_size":26624,"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512,576,640,704,768,832,896,960,1024,1088,1152,1216,1280,1344,1408,1472,1536,1600,1664,1728,1792,1856,1920,1984,2048,2112,2176,2240,2304,2368,2432,2496,2560,2624,2688,2752,2816,2880,2944,3008,3072,3136,3200,3264,3328,3392,3456,3520,3584,3648,3712,3776,3840,3904,3968,4032,4096,4160,4224,4288,4352,4416,4480,4544,4608,4672,4736,4800,4864,4928,4992,5056,5120,5184,5248,5312,5376,5440,5504,5568,5632,5696,5760,5824,5888,5952,6016,6080,6144,6208,6272,6336,6400,6464,6528,6592,6656,6720,6784,6848,6912,6976,7040,7104,7168,7232,7296,7360,7424,7488,7552,7616,7680,7744,7808,7872,7936,8000,8064,8128,8192,8256,8320,8384,8448,8512,8576,8640,8704,8768,8832,8896,8960,9024,9088,9152,9216,9280,9344,9408,9472,9536,9600,9664,9728,9792,9856,9920,9984,10048,10112,10176,10240,10304,10368,10432,10496,10560,10624,10688,10752,10816,10880,10944,11008,11072,11136,11200,11264,11328,11392,11456,11520,11584,11648,11712,11776,11840,11904,11968,12032,12096,12160,12224,12288,12352,12416,12480,12544,12608,12672,12736,12800,12864,12928,12992,13056,13120,13184,13248,13312,13376,13440,13504,13568,13632,13696,13760,13824,13888,13952,14016,14080,14144,14208,14272,14336,14400,14464,14528,14592,14656,14720,14784,14848,14912,14976,15040,15104,15168,15232,15296,15360,15424,15488,15552,15616,15680,15744,15808,15872,15936,16000,16064,16128,16192,16256,16320,16384,16448,16512,16576,16640,16704,16768,16832,16896,16960,17024,17088,17152,17216,17280,17344,17408,17472,17536,17600,17664,17728,17792,17856,17920,17984,18048,18112,18176,18240,18304,18368,18432,18496,18560,18624,18688,18752,18816,18880,18944,19008,19072,19136,19200,19264,19328,19392,19456,19520,19584,19648,19712,19776,19840,19904,19968,20032,20096,20160,20224,20288,20352,20416,20480,20544,20608,20672,20736,20800,20864,20928,20992,21056,21120,21184,21248,21312,21376,21440,21504,21760,22016,22272,22528,22784,23040,23296,23552,23808,24064,24320,24576,24832,25088,25344,25600,25856,26112,26368,26624]}'
+
+  DYNAMO_FRONTEND_FLAGS:
+    value: "--router-mode=kv --load-aware"

@@ -1,0 +1,81 @@
+name: dsr1-gr100-offline-disagg-4c8g-x72-submission
+version: '1.0'
+type: offline
+benchmark_mode: offline
+model_params:
+  name: DeepSeek-R1-NVFP4-v2-mlpinf
+  temperature: 0.0
+  top_k: 1
+  top_p: 1.0
+  max_new_tokens: 20000
+  min_new_tokens: 1
+  skip_special_tokens: true
+  streaming: 'off'
+  tokenizer_name: /model
+datasets:
+- name: dsr1-perf
+  type: performance
+  path: /work/dataset/ds-r1/deepseek_r1_eval.parquet
+- name: deepseek_r1_accuracy
+  type: accuracy
+  path: /work/dataset/ds-r1/deepseek_r1_eval.parquet
+  accuracy_config:
+    eval_method: legacy_mlperf_deepseek_r1
+    ground_truth: ground_truth
+    num_repeats: 1
+    extras:
+      subset_column: dataset
+      question_column: question
+      tokenizer_path: /model
+settings:
+  runtime:
+    min_duration_ms: 5400000
+    max_duration_ms: 9540000
+    n_samples_to_issue: 800000
+    scheduler_random_seed: 16159082839903944936
+    dataloader_random_seed: 2747215439041700203
+  load_pattern:
+    type: max_throughput
+  client:
+    num_workers: 32
+    log_level: INFO
+    warmup_connections: -1
+    max_connections: 40000
+    transport:
+      type: zmq
+      recv_buffer_size: 16777216
+      send_buffer_size: 16777216
+      io_threads: 4
+      worker_io_threads: 1
+      high_water_mark: 0
+      linger: -1
+      immediate: 1
+    stream_all_chunks: false
+    worker_initialization_timeout: 300.0
+    worker_graceful_shutdown_wait: 0.5
+    worker_force_kill_timeout: 0.5
+    insecure: false
+    max_idle_time: 4.0
+    min_required_connections: -1
+    worker_gc_mode: relaxed
+  drain:
+    warmup_timeout_s: 240.0
+    metrics_drain_timeout_s: 0.0
+    metrics_tokenizer_workers: 2
+  warmup:
+    enabled: false
+    salt: true
+    drain: false
+    warmup_random_seed: 42
+  profiling: {}
+  service_ready_timeout_s: 30.0
+endpoint_config:
+  endpoints:
+  - http://10.1.0.237:8001
+  - http://10.1.0.231:8003
+  - http://10.1.0.247:8002
+  - http://10.1.0.236:8000
+  api_type: openai_completions
+report_dir: /place/nfs/slurm/mlperf/vr200/dsr1-nvl72-partner-drop-final/sflow_output/trtllm_disagg-20260731-091819-9dbd20/endpoint_benchmark
+verbose: false
+enable_cpu_affinity: true

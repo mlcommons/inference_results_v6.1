@@ -1,0 +1,175 @@
+# Self-contained sflow workflow: build a "client" enroot .sqsh starting from a
+# base Ubuntu image with the mlcommons/endpoints package pre-installed directly
+# from its Git repository (pinned to a specific commit).
+#
+# Mechanism:
+#   1. srun + pyxis pulls BASE_IMAGE (default ubuntu:24.04) as a writable container.
+#   2. uv is installed and used to pip-install endpoints from GitHub at a pinned ref.
+#   3. --container-save=PATH dumps the modified filesystem to PATH as a .sqsh.
+#
+# Output filename embeds the short Git ref so different builds don't collide:
+#   <DUMP_DIR>/<SQSH_NAME>_<first-8-chars-of-ref>.sqsh
+#
+# Usage:
+#   sflow run -f src/nv_mlpinf/benchmarks/wan22_a14b/scripts/generate_client_sqsh.yaml \
+#     --set DUMP_DIR=/lustre/fsw/coreai_mlperf_inference/$USER/sqsh \
+#     --tui
+#
+# Override the pinned ref:
+#   --set ENDPOINTS_GIT_REF=<commit-sha-or-tag-or-branch>
+#
+# Bake the VBench accuracy venv INTO the image (so accuracy runs reuse it via
+# UV_NO_SYNC=1, no scratch staging) — the locked vbench uv project travels with
+# the image:
+#   sflow run -f src/nv_mlpinf/benchmarks/wan22_a14b/scripts/generate_client_sqsh.yaml \
+#     --set DUMP_DIR=/lustre/fsw/coreai_mlperf_inference/$USER/sqsh \
+#     --set BUILD_VBENCH=1 --set SQSH_NAME=endpoint_client_vbench \
+#     --set SLURM_PARTITION=gb300 --tui     # ^ build on the SAME arch as runtime
+#
+# NOTE: BUILD_VBENCH builds the vbench venv on Python 3.11 (uv-managed, baked in)
+# so tokenizers 0.13.3 installs from its prebuilt aarch64 wheel (cp312 has none).
+# A VBench image MUST be built on the same CPU arch as the runtime cluster
+# (aarch64 for GB300) and the build node needs network egress (PyPI).
+
+version: "0.1"
+
+variables:
+  # --- REQUIRED user inputs ---
+  DUMP_DIR:
+    description: "REQUIRED. Host directory where the .sqsh file is written. Set via --set DUMP_DIR=..."
+    value: ""
+
+  # --- Endpoints source (pinned by default; override with --set) ---
+  ENDPOINTS_GIT_URL:
+    description: "Endpoints Git repository URL"
+    value: "https://github.com/mlcommons/endpoints.git"
+  ENDPOINTS_GIT_REF:
+    description: "Commit SHA / tag / branch to install. Default pins to the commit cloned into 3rdparty/endpoints."
+    value: "85a9375df7113a9aa75381367858c806804f0e29"
+
+  # --- VBench accuracy venv (optional, baked into the image) ---
+  BUILD_VBENCH:
+    description: "Set to 1 to bake the isolated VBench accuracy uv project (examples/09_Wan22_VideoGen_Example/accuracy) + its locked .venv into the image. Accuracy runs then reuse it via UV_NO_SYNC=1 (no scratch staging)."
+    value: "0"
+  VBENCH_PROJECT_PATH:
+    description: "In-image path the locked vbench uv project is materialized at. Must match the accuracy configs' vbench_project_path."
+    value: "/opt/vbench_accuracy"
+
+  # --- Optional ---
+  BASE_IMAGE:
+    description: "Source Docker image used as the build base"
+    value: docker://ubuntu:24.04
+  SQSH_NAME:
+    description: "Prefix for the saved .sqsh; the first 8 chars of ENDPOINTS_GIT_REF are appended"
+    value: "endpoint_client"
+  SQSH_FILE:
+    description: "Computed full output path: <DUMP_DIR>/<SQSH_NAME>_<short-ref>.sqsh"
+    value: "${{ variables.DUMP_DIR }}/${{ variables.SQSH_NAME }}_${{ variables.ENDPOINTS_GIT_REF[:8] }}.sqsh"
+
+  # --- Slurm cluster fields ---
+  SLURM_ACCOUNT:
+    description: "Slurm account"
+    value: coreai_mlperf_inference
+  SLURM_PARTITION:
+    description: "Slurm partition"
+    value: 36x2-a01r
+  SLURM_TIME:
+    description: "Slurm walltime (HH:MM:SS) — apt + uv pip install can take a few minutes"
+    value: "00:30:00"
+
+operators:
+  # Local bash, used to prepare the host-side output directory.
+  - name: host_bash
+    type: bash
+
+  - name: client_sqsh_build
+    type: srun
+    container_image: ${{ variables.BASE_IMAGE }}
+    # Writable container so apt + uv pip install can modify the rootfs that pyxis saves.
+    container_writable: true
+    container_remap_root: true
+    extra_args:
+      - "--container-save=${{ variables.SQSH_FILE }}"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: 1
+    gpus_per_node: 4
+    extra_args:
+      - "--exclusive"
+
+workflow:
+  name: generate_client_sqsh
+  tasks:
+    # Runs on the host (login node) so pyxis has somewhere on the host filesystem
+    # to write the saved .sqsh when the container exits.
+    - name: prep_dump_dir
+      operator:
+        name: host_bash
+      script:
+        - 'mkdir -p "${{ variables.DUMP_DIR }}"'
+        - 'echo "Prepared host directory ${{ variables.DUMP_DIR }}"'
+
+    - name: build_image
+      depends_on:
+        - prep_dump_dir
+      operator:
+        name: client_sqsh_build
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        - 'echo "Base image ${{ variables.BASE_IMAGE }}"'
+        - 'echo "Endpoints source ${{ variables.ENDPOINTS_GIT_URL }}@${{ variables.ENDPOINTS_GIT_REF }}"'
+        - 'echo "Output sqsh ${{ variables.SQSH_FILE }}"'
+        - set -euo pipefail
+        - export DEBIAN_FRONTEND=noninteractive
+        - apt-get update
+        # build-essential + python3-dev are required to compile C-extension deps
+        # (e.g. hdrhistogram), which inference-endpoint pulls in transitively.
+        # libgl1 + libglib2.0-0: opencv (cv2) — pulled in by the VBench accuracy
+        # scorer's video reader — needs libGL.so.1 / libgthread at import time.
+        - apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev build-essential git curl ca-certificates libgl1 libglib2.0-0
+        # Install uv into the container rootfs (not in $HOME, which doesn't persist).
+        - 'curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh'
+        - 'uv pip install --system "inference-endpoint @ git+${{ variables.ENDPOINTS_GIT_URL }}@${{ variables.ENDPOINTS_GIT_REF }}" --break-system-packages'
+        - 'python3 -c "import inference_endpoint; print(inference_endpoint.__file__)"'
+        # Optional: bake the isolated VBench accuracy venv into the image. The
+        # vbench uv project lives under the endpoints repo's examples/ (NOT in the
+        # installed package), so fetch it at the same pinned ref and `uv sync` the
+        # committed lockfile. Use the image's system python so the venv refers to
+        # /usr/bin/python3 (present at runtime) rather than a uv-managed python
+        # that wouldn't persist. Accuracy runs reuse this via UV_NO_SYNC=1.
+        - |
+          if [ "${{ variables.BUILD_VBENCH }}" = "1" ]; then
+            echo "Baking VBench accuracy venv into ${{ variables.VBENCH_PROJECT_PATH }}"
+            git clone "${{ variables.ENDPOINTS_GIT_URL }}" /tmp/endpoints
+            git -C /tmp/endpoints checkout "${{ variables.ENDPOINTS_GIT_REF }}"
+            cp -r /tmp/endpoints/examples/09_Wan22_VideoGen_Example/accuracy "${{ variables.VBENCH_PROJECT_PATH }}"
+            cd "${{ variables.VBENCH_PROJECT_PATH }}"
+            # Wheel-only install — NO Rust / source builds:
+            #  * tokenizers 0.13.3 (transformers 4.33.2 <- vbench 0.1.5) has aarch64
+            #    wheels for cp310/cp311 but NOT cp312, so build the venv on Python 3.11
+            #    (uv-managed, baked into the image) to pull the prebuilt wheel instead
+            #    of compiling from source (which is unbuildable: tokenizers needs old
+            #    rustc but its transitive crates need a new edition).
+            #  * decord 0.6.0 has no aarch64 wheel at all -> decord2 (drop-in, module
+            #    `decord`, ships aarch64+x86_64 wheels); override the bare decord req out.
+            sed -i 's#requires-python = ">=3.12"#requires-python = ">=3.10"#' pyproject.toml
+            sed -i 's#    "vbench==0.1.5",#    "vbench==0.1.5",\n    "decord2>=3.4.0",#' pyproject.toml
+            sed -i 's#^package = false#package = false\noverride-dependencies = ["decord; sys_platform == @never@"]#' pyproject.toml
+            sed -i "s#@never@#'never'#" pyproject.toml
+            export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+            uv lock --python 3.11
+            uv sync --python 3.11
+            uv run python -c "import torch, decord, tokenizers, vbench; print('vbench', vbench.__file__, '| decord', decord.__version__, '| tokenizers', tokenizers.__version__, '| torch', torch.__version__)"
+            rm -rf /tmp/endpoints
+          fi
+        - 'echo done'

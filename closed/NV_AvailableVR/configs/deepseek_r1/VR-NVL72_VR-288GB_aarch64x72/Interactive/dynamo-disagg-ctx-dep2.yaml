@@ -1,0 +1,67 @@
+# DeepSeek-R1, Vera Rubin NVL72 (72 GPUs), Interactive: prefill (context) workers, TensorRT-LLM LLM-API options.
+backend: pytorch
+tensor_parallel_size: 2
+moe_expert_parallel_size: 2
+enable_attention_dp: true
+pipeline_parallel_size: 1
+max_batch_size: 128
+max_num_tokens: 16640
+max_seq_len: 3200
+cuda_graph_config: null
+disable_overlap_scheduler: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.85
+  dtype: nvfp4
+  tokens_per_block: 128
+moe_config:
+  backend: CUTEDSL
+nvfp4_gemm_config:
+  allowed_backends:
+  - cutlass
+  - cublaslt
+  - cuda_core
+cache_transceiver_config:
+  max_tokens_in_buffer: 36864
+  backend: NIXL
+  kv_transfer_timeout_ms: 7200000
+  transceiver_runtime: PYTHON
+  kv_transfer_sender_future_timeout_ms: 10
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: FIRST_COME_FIRST_SERVED
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3
+  max_draft_len: 3
+use_cute_dsl_bf16_bmm: true
+use_cute_dsl_bf16_gemm: true
+print_iter_log: true
+enable_iter_perf_stats: false
+return_perf_metrics: false
+prefill_cuda_graph_backend: breakable
+prefill_capture_num_tokens:
+- 1
+- 2
+- 4
+- 8
+- 16
+- 32
+- 64
+- 128
+- 256
+- 512
+- 768
+- 1024
+- 1280
+- 1536
+- 1792
+- 2048
+- 2304
+- 2560
+- 2816
+- 3072
+- 3584
+- 4096
+- 5120
+- 6144

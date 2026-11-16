@@ -1,0 +1,137 @@
+{
+ "visual.blocks.0.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.1.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.2.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.3.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.4.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.5.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.6.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.7.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.8.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.9.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.10.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.11.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.12.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.13.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.14.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.15.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.16.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.17.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.18.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.19.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.20.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.21.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.22.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.23.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.24.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.25.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ },
+ "visual.blocks.26.attn.attn": {
+  "q": 1.0,
+  "k": 1.0,
+  "v": 1.0
+ }
+}

@@ -1,0 +1,93 @@
+# DeepSeek-R1, Vera Rubin NVL72 (72 GPUs), Offline: Slurm and container settings (pyxis/enroot).
+variables:
+  ENDPOINT_CONTAINER_IMAGE:
+    description: "MLPerf Endpoints client image (mlcommons/endpoints 598dbfde). Registry image or a .sqsh; pass via --set to override."
+    value: "ghcr.io/mlcommons/endpoints:598dbfde"
+  LCB_CONTAINER_IMAGE:
+    description: "LiveCodeBench grader image (lcb-service, built from mlcommons/endpoints lcb_serve.dockerfile). Registry image or a .sqsh; pass via --set to override."
+    value: "ghcr.io/mlcommons/endpoints:9d749906-livecodebench"
+
+  WORK_DIR:
+    description: "REQUIRED. Host path to closed/NVIDIA of this repo (or a snapshot of it), mounted at the same path inside every container. Set via --set WORK_DIR=..."
+    value: ""
+  SCRATCH_DIR:
+    description: "REQUIRED. Host path holding models/ and data/ (MODEL_PATH and DATA_PATH of the point config), mounted at the same path inside every container. Set via --set SCRATCH_DIR=..."
+    value: ""
+  SITE_ENV_YAML:
+    description: "Optional flat KEY: value env overlay applied after the worker env yaml (later keys win). Empty = none."
+    value: ""
+  CONTAINER_MOUNTS:
+    value: "${{ variables.WORK_DIR }}:${{ variables.WORK_DIR }},${{ variables.SCRATCH_DIR }}:${{ variables.SCRATCH_DIR }}"
+
+  MEM_CLOCK_MHZ:
+    description: "HBM clock in MHz pinned on every node (nvidia-smi -lmc) before the servers start and released after the client; 0 = leave the clocks as they are."
+    type: integer
+    value: 4752
+  SLURM_ACCOUNT:
+    value: ""
+  SLURM_PARTITION:
+    description: "Your SLURM partition for the GPU nodes. Read by `sflow run`; for `sflow batch` pass --partition=<...> instead."
+    value: ""
+  SLURM_TIME:
+    value: "05:00:00"
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+  SLURM_NODES:
+    description: "Computed: ceil(TOTAL_GPUS / GPUS_PER_NODE)."
+    type: integer
+    value: ${{ ((variables.TOTAL_GPUS / variables.GPUS_PER_NODE) | round(0, "ceil")) | int }}
+  SEGMENT:
+    description: "Topology segment size. =SLURM_NODES -> one rack (NVLink). =1 -> max spread across racks. Override with --set SEGMENT=1."
+    type: integer
+    value: ${{ variables.SLURM_NODES }}
+
+operators:
+  - name: host_srun
+    type: srun
+
+  - name: host_bash
+    type: bash
+
+  - name: trtllm_disagg_container
+    type: srun
+    container_image: ${{ variables.CONTAINER_IMAGE }}
+    container_writable: false
+    container_mount_home: true
+    container_remap_root: true
+    mpi: pmix
+    container_mounts:
+      - ${{ variables.CONTAINER_MOUNTS }}
+
+  - name: endpoint_container
+    type: srun
+    container_image: ${{ variables.ENDPOINT_CONTAINER_IMAGE }}
+    container_writable: false
+    container_mount_home: false
+    container_remap_root: true
+    mpi: pmix
+    container_mounts:
+      - ${{ variables.CONTAINER_MOUNTS }}
+
+  - name: lcb_container
+    type: srun
+    container_image: ${{ variables.LCB_CONTAINER_IMAGE }}
+    container_writable: false
+    container_mount_home: false
+    container_remap_root: false
+    container_mounts:
+      - ${{ variables.CONTAINER_MOUNTS }}
+    container_workdir: /app
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    gpus_per_node: ${{ variables.GPUS_PER_NODE }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: ${{ variables.SLURM_NODES }}
+    extra_args:
+      - "--segment=${{ variables.SEGMENT }}"
+      - "--exclusive"

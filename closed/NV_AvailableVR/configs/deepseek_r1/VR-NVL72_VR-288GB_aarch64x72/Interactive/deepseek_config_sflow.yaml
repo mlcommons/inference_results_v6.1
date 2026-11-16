@@ -1,0 +1,84 @@
+# DeepSeek-R1, Vera Rubin NVL72 (72 GPUs), Interactive: nv-sflow point configuration (layout, model, files).
+# Compose with slurm_env_sflow.yaml (this directory) and
+# scaleout/sflow/templates/<LAUNCH_TEMPLATE>; see src/nv_mlpinf/benchmarks/deepseek_r1/README.md.
+variables:
+  NUM_CTX_SERVERS:
+    type: integer
+    value: 4
+  GPUS_PER_CTX_RANK:
+    type: integer
+    value: 2
+  NUM_GEN_SERVERS:
+    type: integer
+    value: 4
+  GPUS_PER_GEN_RANK:
+    type: integer
+    value: 16
+  TOTAL_GPUS:
+    description: "Aggregate GPU count: ctx + gen"
+    type: integer
+    value: ${{ variables.NUM_CTX_SERVERS * variables.GPUS_PER_CTX_RANK + variables.NUM_GEN_SERVERS * variables.GPUS_PER_GEN_RANK }}
+  NUM_FRONTEND_SERVERS:
+    type: integer
+    value: 8
+  CLIENT_NODE_INDEX:
+    description: "Node index for etcd/nats, frontends, LCB and the client (0-GPU tasks)."
+    type: integer
+    value: 0
+  FRONTEND_PORT:
+    type: integer
+    value: 8000
+  ETCD_PORT:
+    type: integer
+    value: 2379
+  NATS_PORT:
+    type: integer
+    value: 4222
+  DYN_NAMESPACE:
+    value: dsr1
+  FRONTEND_ROUTER_ARGS:
+    description: "dynamo.frontend routing arguments (load-based round-robin routing)."
+    value: --router-mode round-robin --namespace-prefix pair
+  GEN_REPLICAS_PER_PAIR:
+    description: "Decode replicas per pair (pair template)."
+    value: 1
+  GEN_NODES_PER_REPLICA:
+    description: "Nodes per decode replica (GPUS_PER_GEN_RANK / 4)."
+    value: 4
+  LAUNCH_NODES:
+    description: "Nodes to allocate: one NVL72 rack."
+    value: 18
+  LAUNCH_SEGMENT:
+    description: "Slurm --segment: the whole rack in one NVLink domain."
+    value: 18
+  LAUNCH_TEMPLATE:
+    value: dynamo_disagg_rack18_endpoints_dsr1_perf_acc.yaml
+  SERVED_MODEL_NAME:
+    description: "Served model name; equals model_params.name of endpoint.yaml."
+    value: DeepSeek-R1-NVFP4-v2-mlpinf
+
+  CONTAINER_IMAGE:
+    description: "Dynamo + TensorRT-LLM server image (.sqsh or registry image), see docker/vr-dsr1-trtllm-dynamo."
+    value: ""
+  MODEL_PATH:
+    value: ${{ variables.SCRATCH_DIR }}/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4-v2
+  DATA_PATH:
+    value: ${{ variables.SCRATCH_DIR }}/data/deepseek-r1-endpoints/deepseek_r1_eval.parquet
+  TRTLLM_YAML_CTX:
+    value: ${{ variables.WORK_DIR }}/configs/deepseek_r1/VR-NVL72_VR-288GB_aarch64x72/Interactive/dynamo-disagg-ctx-dep2.yaml
+  TRTLLM_ENV_YAML_CTX:
+    value: ${{ variables.WORK_DIR }}/configs/deepseek_r1/VR-NVL72_VR-288GB_aarch64x72/Interactive/dynamo-disagg-ctx-dep2-env.yaml
+  TRTLLM_YAML_GEN:
+    value: ${{ variables.WORK_DIR }}/configs/deepseek_r1/VR-NVL72_VR-288GB_aarch64x72/Interactive/dynamo-disagg-gen-dep16.yaml
+  TRTLLM_ENV_YAML_GEN:
+    value: ${{ variables.WORK_DIR }}/configs/deepseek_r1/VR-NVL72_VR-288GB_aarch64x72/Interactive/dynamo-disagg-gen-dep16-env.yaml
+  ENDPOINT_CONFIG:
+    value: ${{ variables.WORK_DIR }}/configs/deepseek_r1/VR-NVL72_VR-288GB_aarch64x72/Interactive/endpoint.yaml
+  ENDPOINT_ENV_YAML:
+    value: ${{ variables.WORK_DIR }}/configs/deepseek_r1/VR-NVL72_VR-288GB_aarch64x72/Interactive/endpoint-env.yaml
+  MODE:
+    description: "Endpoint benchmark mode: perf, acc, or both (both = performance then accuracy in one invocation)."
+    value: both
+  CLIENT_URL_HOST:
+    description: "Address the client uses for the frontends, which run on its node: node (the node IP address) or 127.0.0.1 (loopback)."
+    value: node

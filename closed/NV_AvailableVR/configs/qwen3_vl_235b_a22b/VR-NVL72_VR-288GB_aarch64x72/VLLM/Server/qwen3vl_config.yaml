@@ -1,0 +1,66 @@
+# Qwen3-VL — VR-NVL72 Server scenario perf run (18 nodes × 4 GPUs).
+
+variables:
+  TOTAL_GPUS:
+    type: integer
+    value: 72
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+  GPUS_PER_WORKER:
+    description: "TP × PP × DP = 1 × 1 × 1. Must match the corresponding flags in VLLM_FLAGS."
+    type: integer
+    value: 1
+
+  WORKFLOW_TIMEOUT:
+    value: "230m"
+
+  # Memclk: pin DRAM to max (MEMCLK_PIN_MHZ) for the whole run -> ~+4-5% where bandwidth-bound.
+  # The 18-node job runs without a node-type constraint (submit with -e '--segment=1'), so the
+  # allocation can include 'cr' nodes, which reject the lock (-lmc). '[memclk pinned]' in the
+  # log means the clocks read the target, not a verified lock.
+  ENABLE_MEMCLK_PIN:
+    value: "1"
+
+  MODEL_REPO_ID:
+    value: "nvidia/Qwen3-VL-235B-A22B-Instruct-NVFP4-MLPerf-Inference-Closed-V6.1-FP8-KV"
+
+  ENDPOINT_CONFIG:
+    value: "/work/configs/qwen3_vl_235b_a22b/VR-NVL72_VR-288GB_aarch64x72/VLLM/Server/endpoint.yaml"
+
+  WORKER_ENV_YAML:
+    value: "/work/configs/qwen3_vl_235b_a22b/VR-NVL72_VR-288GB_aarch64x72/VLLM/Server/worker_env.yaml"
+
+
+  # Built from public sources with the pins of
+  # src/nv_mlpinf/benchmarks/q3vl/rubin/scripts/build_image.sh (see rubin/README.md):
+  # vLLM + FlashInfer q3vl-release-parity, with the tuned Rubin FMHA exports in FlashInfer's
+  # pinned cubin collection (no FLASHINFER_DSL_FMHA_LOCAL_DIR). Pinned by digest.
+  CONTAINER_IMAGE:
+    value: "gitlab-master.nvidia.com:5005/mlpinf/mlperf-inference/mlperf-inf-mm-q3vl-nv:arm64_cuda134_q3vlpublic_202610272018@sha256:768f0b37f404e14c177cf386b824ab5ce864dccca2a283bc17ef7e175172cfb6"
+
+  VLLM_FLAGS:
+    value: >-
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --data-parallel-size 1
+      --async-scheduling
+      --max-model-len 32768
+      --max-num-seqs 1536
+      --max-num-batched-tokens 8192
+      --mm-encoder-attn-backend FLASHINFER
+      --override-generation-config '{"max_new_tokens": 150}'
+      --limit-mm-per-prompt.video 0
+      --no-enable-prefix-caching
+      --enable-multimodal
+      --kv-events-config '{"publisher":"null"}'
+      --mm-processor-cache-gb 0
+      --mm-encoder-attn-dtype=fp8
+      --mm-encoder-fp8-scale-path=/work/configs/qwen3_vl_235b_a22b/_shared/vit_fp8_scales_all1.json
+      --enable-flashinfer-autotune
+      --moe-backend flashinfer_cutedsl
+      --scheduling-policy priority
+      --compilation-config '{"compile_mm_encoder":true,"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true,"fuse_attn_quant":true},"use_inductor_graph_partition":true,"inductor_compile_config":{"max_autotune":true,"coordinate_descent_tuning":true},"cudagraph_mm_encoder":"true","encoder_cudagraph_token_budgets":[1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384],"encoder_cudagraph_max_vision_items_per_batch":16,"encoder_cudagraph_max_frames_per_batch":16,"max_cudagraph_capture_size":8192,"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512,576,640,704,768,832,896,960,1024,1088,1152,1216,1280,1344,1408,1472,1536,1600,1664,1728,1792,1856,1920,1984,2048,2112,2176,2240,2304,2368,2432,2496,2560,2624,2688,2752,2816,2880,2944,3008,3072,3136,3200,3264,3328,3392,3456,3520,3584,3648,3712,3776,3840,3904,3968,4032,4096,4160,4224,4288,4352,4416,4480,4544,4608,4672,4736,4800,4864,4928,4992,5056,5120,5184,5248,5312,5376,5440,5504,5568,5632,5696,5760,5824,5888,5952,6016,6080,6144,6208,6272,6336,6400,6464,6528,6592,6656,6720,6784,6848,6912,6976,7040,7104,7168,7232,7296,7360,7424,7488,7552,7616,7680,7744,7808,7872,7936,8000,8064,8128,8192]}'
+
+  DYNAMO_FRONTEND_FLAGS:
+    value: "--router-mode=kv --load-aware"

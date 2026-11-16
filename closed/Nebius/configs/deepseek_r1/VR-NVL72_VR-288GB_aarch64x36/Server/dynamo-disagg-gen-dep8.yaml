@@ -1,0 +1,102 @@
+# DeepSeek-R1, Vera Rubin NVL72 half rack (36 GPUs), Server: decode (generation) workers, TensorRT-LLM LLM-API options.
+backend: pytorch
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: true
+enable_lm_head_tp_in_adp: true
+pipeline_parallel_size: 1
+max_batch_size: 1536
+max_num_tokens: 5120
+max_seq_len: 23200
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.96
+  dtype: nvfp4
+  tokens_per_block: 128
+moe_config:
+  backend: CUTEDSL_FC12
+  use_low_precision_moe_combine: false
+nvfp4_gemm_config:
+  allowed_backends:
+  - cutlass
+  - cublaslt
+  - cutedsl
+  - cuda_core
+cache_transceiver_config:
+  max_tokens_in_buffer: 36864
+  backend: NIXL
+  kv_transfer_timeout_ms: 7200000
+  transceiver_runtime: PYTHON
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 12
+  - 16
+  - 20
+  - 24
+  - 28
+  - 32
+  - 36
+  - 40
+  - 44
+  - 48
+  - 52
+  - 56
+  - 60
+  - 64
+  - 72
+  - 80
+  - 88
+  - 96
+  - 104
+  - 112
+  - 120
+  - 128
+  - 160
+  - 192
+  - 224
+  - 256
+  - 288
+  - 320
+  - 352
+  - 384
+  - 416
+  - 448
+  - 480
+  - 512
+  - 544
+  - 576
+  - 608
+  - 640
+  - 672
+  - 704
+  - 736
+  - 768
+  - 800
+  - 832
+  - 864
+  - 896
+  - 928
+  - 960
+  - 992
+  - 1024
+  - 1088
+  - 1152
+  - 1216
+  - 1280
+  - 1344
+  - 1408
+  - 1472
+  - 1536
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: FIRST_COME_FIRST_SERVED
+speculative_config: null
+print_iter_log: true
+enable_iter_perf_stats: false
+stream_interval: 50
+return_perf_metrics: false

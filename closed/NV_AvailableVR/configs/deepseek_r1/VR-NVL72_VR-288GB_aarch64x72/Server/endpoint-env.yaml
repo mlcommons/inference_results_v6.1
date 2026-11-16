@@ -1,0 +1,3 @@
+# DeepSeek-R1, Vera Rubin NVL72 (72 GPUs), Server: MLPerf Endpoints client environment.
+PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HF_HOME: /tmp/hf_cache_dsr1

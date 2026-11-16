@@ -1,0 +1,80 @@
+# Self-contained sflow workflow: import a Docker image and save it as an enroot
+# .sqsh file at a user-specified path.
+#
+# Mechanism: srun + pyxis with --container-image=docker://... runs a no-op inside
+# the container; --container-save=PATH tells pyxis to dump the imported filesystem
+# to PATH as a squashfs.
+#
+# Usage:
+#   sflow run -f scaleout/templates/generate_sqsh.yaml \
+#     --set DOCKER_IMAGE=docker://nvcr.io/nvidia/pytorch:24.10-py3 \
+#     --set DUMP_DIR=/lustre/fsw/coreai_mlperf_inference/$USER/sqsh \
+#     --set SQSH_NAME=pytorch_24_10 \
+#     --tui
+#
+# Cluster fields (SLURM_ACCOUNT, SLURM_PARTITION, SLURM_TIME, ...) can all be
+# overridden with --set.
+
+version: "0.1"
+
+variables:
+  # --- REQUIRED user inputs ---
+  DOCKER_IMAGE:
+    description: "REQUIRED. Source Docker image URL (e.g. docker://nvcr.io/...). Set via --set DOCKER_IMAGE=..."
+    value: ""
+  DUMP_DIR:
+    description: "REQUIRED. Host directory where the .sqsh file is written. Set via --set DUMP_DIR=..."
+    value: ""
+  SQSH_NAME:
+    description: "Filename (without .sqsh extension) for the saved image"
+    value: "image"
+
+  # --- Slurm cluster fields (override with --set) ---
+  SLURM_ACCOUNT:
+    description: "Slurm account"
+    value: coreai_mlperf_inference
+  SLURM_PARTITION:
+    description: "Slurm partition"
+    value: 36x2-a01r
+  SLURM_TIME:
+    description: "Slurm walltime (HH:MM:SS) — image import is usually fast"
+    value: "00:30:00"
+
+operators:
+  - name: sqsh_import
+    type: srun
+    container_image: ${{ variables.DOCKER_IMAGE }}
+    container_writable: false
+    container_remap_root: true
+    # pyxis writes the imported filesystem here when the container exits.
+    extra_args:
+      - "--container-save=${{ variables.DUMP_DIR }}/${{ variables.SQSH_NAME }}.sqsh"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: 1
+    gpus_per_node: 4
+    extra_args:
+      - "--exclusive"
+
+workflow:
+  name: generate_sqsh
+  tasks:
+    - name: import_image
+      operator:
+        name: sqsh_import
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        - 'mkdir -p "${{ variables.DUMP_DIR }}"'
+        - 'echo "Importing ${{ variables.DOCKER_IMAGE }} into ${{ variables.DUMP_DIR }}/${{ variables.SQSH_NAME }}.sqsh"'
+        # No-op inside the container; the actual save happens via pyxis --container-save.
+        - 'echo done'

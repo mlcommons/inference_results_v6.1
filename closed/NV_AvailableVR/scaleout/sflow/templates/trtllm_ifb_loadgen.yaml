@@ -1,0 +1,102 @@
+version: "0.1"
+
+# IFB (In-Flight Batching) workflow with MLPerf loadgen client.
+# Mirrors run_scaleout.sh: launches DP_MULTIPLICITY trtllm-serve replicas (one per
+# data-parallel rank), then runs nv-mlpinf run_harness against the union of URLs.
+#
+# Pair this template with a config folder containing:
+#   - <benchmark>_config_sflow.yaml  (workflow variables: DP_MULTIPLICITY, model/yaml paths, harness args)
+#   - slurm_env_sflow.yaml      (container, mounts, slurm backend; defines test_container operator)
+#   - trtllm-serve-ifb-*-{,env-}yaml  (per-DP-rank trtllm-serve config copied from the
+#                                     non-_sflow scenario folder so numbers match)
+
+variables:
+  BASE_PORT:
+    description: "Base port; each replica gets BASE_PORT + SFLOW_REPLICA_INDEX"
+    value: 8336
+  COLLECT_NSYS:
+    description: "Set to 1 to collect one nsys profile per trtllm-serve rank. GPU metrics are restricted to each rank's SLURM_LOCALID."
+    value: "0"
+  # DP_MULTIPLICITY, GPUS_PER_DP_RANK, GPUS_PER_NODE, MODEL_PATH, TRTLLM_YAML,
+  # TRTLLM_ENV_YAML, BENCHMARK, SCENARIO, SYSTEM_NAME, TEST_MODE, HARNESS_EXTRA_ARGS are
+  # supplied by the per-experiment <benchmark>_config_sflow.yaml, CI generator, and slurm_env_sflow.yaml.
+
+artifacts:
+  - name: SERVER_URLS
+    uri: file://server_urls.txt
+    content: ""
+
+workflow:
+  name: trtllm_ifb
+  tasks:
+    - name: server
+      replicas:
+        count: ${{ variables.DP_MULTIPLICITY }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_DP_RANK }}
+      operator:
+        name: test_container
+        ntasks: ${{ variables.GPUS_PER_DP_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_DP_RANK, variables.GPUS_PER_NODE] | min }}
+      script:
+        # Register this replica's URL into SERVER_URLS (plain ip:port, one per line)
+        - if [ "${SLURM_PROCID:-0}" = "0" ]; then echo "$(echo ${SFLOW_TASK_ASSIGNED_NODE_IPS} | cut -d',' -f1):$(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX} ))" >> ${{ artifacts.SERVER_URLS.path }}; fi
+        # Load env.yaml: print each export to stderr (logged), then eval to apply in current shell
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.TRTLLM_ENV_YAML }} | tee /dev/stderr)"
+        # patch the trtllm source code to disable tinygemm in gptoss
+        - python3 /work/scaleout/sflow/tools/apply_trtllm_pr15790_disable_tinygemm2.py
+        - export FLASHINFER_WORKSPACE_BASE=/tmp/${SLURM_JOB_USER:-${USER}}/flashinfer_${SLURM_JOB_ID}_${SLURM_PROCID}
+        - mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
+        - >
+          NSYS_CMD="";
+          if [ "${{ variables.COLLECT_NSYS }}" = "1" ]; then
+            NSYS_CMD="/usr/local/bin/nsys profile --force-overwrite=true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace=node --capture-range-end=stop --gpu-metrics-devices=${SLURM_LOCALID} --wait=all --output ${SFLOW_TASK_OUTPUT_DIR}/nsys_profile-dp${SFLOW_REPLICA_INDEX}-rank${SLURM_PROCID}";
+          fi;
+          ${NSYS_CMD} trtllm-llmapi-launch
+          trtllm-serve ${{ variables.MODEL_PATH }}
+          --host 0.0.0.0
+          --port $(( ${{ variables.BASE_PORT }} + ${SFLOW_REPLICA_INDEX} ))
+          --extra_llm_api_options ${{ variables.TRTLLM_YAML }}
+          2>&1 | tee ${SFLOW_TASK_OUTPUT_DIR}/rank${SLURM_PROCID}.log
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Application startup complete"
+          timeout: 600
+          interval: 10
+
+    - name: mlperf_harness
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        # Install nv-mlpinf into this task's container — only the harness needs
+        # it (trtllm-serve workers don't import nv_mlpinf). PYTHONUNBUFFERED so
+        # progress streams to sflow.log without buffering.
+        - export PYTHONUNBUFFERED=1
+        - pip install -e ".[llm]" -q --no-build-isolation
+        - SERVER_URLS=$(grep -v '^[[:space:]]*$' ${{ artifacts.SERVER_URLS.path }} | paste -sd ',')
+        - echo "Server URLs ${SERVER_URLS}"
+        - |
+          set +e
+          set -o pipefail
+          HARNESS_LOG=${SFLOW_TASK_OUTPUT_DIR}/${{ variables.TEST_MODE }}.log
+          LOG_DIR=${SFLOW_TASK_OUTPUT_DIR}/${{ variables.TEST_MODE }} \
+            nv-mlpinf run_harness \
+              --benchmarks=${{ variables.BENCHMARK }} \
+              --scenarios=${{ variables.SCENARIO }} \
+              --system_name=${{ variables.SYSTEM_NAME }} \
+              --trtllm_server_urls=${SERVER_URLS} \
+              --test_mode=${{ variables.TEST_MODE }} \
+              ${{ variables.HARNESS_EXTRA_ARGS }} 2>&1 | tee "${HARNESS_LOG}"
+          HARNESS_EXIT=$?
+          echo "=== mlperf_harness run_harness exited with ${HARNESS_EXIT}; outside validation will decide job status ==="
+          exit 0
+      depends_on:
+        - server

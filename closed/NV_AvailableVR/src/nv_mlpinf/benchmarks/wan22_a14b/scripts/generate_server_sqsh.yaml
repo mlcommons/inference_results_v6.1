@@ -1,0 +1,159 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# Self-contained sflow workflow: build the wan22-a14b TRT-LLM VisualGen server
+# .sqsh (the one slurm_env.yaml's CONTAINER_IMAGE points at), restricted to
+# Blackwell sm100 (GB200) + sm103 (GB300) only.
+#
+# Traces the 0528 build (build_multiarch/CMakeCache.txt: CMAKE_CUDA_ARCHITECTURES
+# = 100-real;103-real):
+#   1. srun + pyxis launches the TRT-LLM SBSA devel image as a WRITABLE container.
+#   2. build_wheel.py compiles+installs TensorRT-LLM (incl. the VisualGen TE FP8
+#      attention backend) for ONLY sm100+sm103 -> a fast, small build.
+#   3. the wan22 VisualGen runtime deps are pip-installed.
+#   4. --container-save dumps the modified filesystem to PATH as a .sqsh.
+#
+# Output:  <DUMP_DIR>/<SQSH_NAME>-sm100_sm103.sqsh
+#
+# Usage (from closed/NVIDIA): all three --set flags are REQUIRED (no defaults).
+#   sflow run -f src/nv_mlpinf/benchmarks/wan22_a14b/scripts/generate_server_sqsh.yaml \
+#     --set DUMP_DIR=/lustre/fsw/coreai_mlperf_inference/$USER/sqsh \
+#     --set TRTLLM_REPO=$PWD/3rdparty/trtllm \
+#     --set BUILD_IMAGE=<TRT-LLM SBSA devel .sqsh or registry tag> \
+#     --tui
+#
+# Prereqs: the trtllm repo must be checked out at the pinned commit with its
+# build-time deps available (TRT-LLM uses CMake FetchContent, so a network-
+# enabled build node or a populated fetch cache is required). The 3rdparty/trtllm
+# submodule checked out on feat/1.3-mlpinf-vg is the canonical source (see the
+# README "TRT-LLM checkout" note — the repo-wide submodule pin stays feat/1.2-mlpinf).
+
+version: "0.1"
+
+variables:
+  # --- REQUIRED user inputs ---
+  DUMP_DIR:
+    description: "REQUIRED. Host dir where the .sqsh is written. Set via --set DUMP_DIR=..."
+    value: ""
+  TRTLLM_REPO:
+    description: "REQUIRED. Host path to the TRT-LLM checkout to build (e.g. closed/NVIDIA/3rdparty/trtllm, checked out on feat/1.3-mlpinf-vg for this build). Bind-mounted at the same path in-container."
+    value: ""
+
+  # --- Build config ---
+  CUDA_ARCHS:
+    description: "GPU arches to compile (Blackwell GB200=sm100, GB300=sm103). Keep minimal for a fast build."
+    value: "100-real;103-real"
+  BUILD_IMAGE:
+    description: "REQUIRED. TRT-LLM SBSA (aarch64) devel image with the build toolchain. Pass via --set BUILD_IMAGE=... — use the LLM_SBSA_DOCKER_IMAGE from <repo>/jenkins/current_image_tags.properties (a registry tag pyxis pulls via docker://), or a local .sqsh of it. Empty default so no host-specific path is baked in."
+    value: ""
+  BUILD_WHEEL_ARGS:
+    description: "Extra build_wheel.py flags (matches the 0528 compile harness defaults)."
+    value: "--trt_root /usr/local/tensorrt --benchmarks --nvtx"
+
+  # --- Output ---
+  SQSH_NAME:
+    value: "wan22-trtllm-server"
+  SQSH_FILE:
+    value: "${{ variables.DUMP_DIR }}/${{ variables.SQSH_NAME }}-sm100_sm103.sqsh"
+
+  # --- Slurm cluster fields ---
+  SLURM_ACCOUNT:
+    value: coreai_mlperf_inference
+  SLURM_PARTITION:
+    value: gb300
+  SLURM_TIME:
+    description: "build_wheel.py for 2 arches is ~1-2h; container-save adds time."
+    value: "03:00:00"
+
+operators:
+  - name: host_bash
+    type: bash
+
+  - name: server_sqsh_build
+    type: srun
+    container_image: ${{ variables.BUILD_IMAGE }}
+    # writable so build_wheel + pip modify the rootfs that pyxis saves
+    container_writable: true
+    container_remap_root: true
+    no_container_mount_home: true
+    mpi: pmix
+    container_mounts:
+      - ${{ variables.TRTLLM_REPO }}:${{ variables.TRTLLM_REPO }}
+      - ${{ variables.DUMP_DIR }}:${{ variables.DUMP_DIR }}
+    extra_args:
+      - "--container-save=${{ variables.SQSH_FILE }}"
+
+backends:
+  - name: slurm_cluster
+    type: slurm
+    default: true
+    account: ${{ variables.SLURM_ACCOUNT }}
+    partition: ${{ variables.SLURM_PARTITION }}
+    time: ${{ variables.SLURM_TIME }}
+    nodes: 1
+    gpus_per_node: 4
+    extra_args:
+      - "--exclusive"
+
+workflow:
+  name: generate_server_sqsh
+  tasks:
+    - name: prep_dump_dir
+      operator:
+        name: host_bash
+      script:
+        - 'mkdir -p "${{ variables.DUMP_DIR }}"'
+        - 'echo "Prepared host directory ${{ variables.DUMP_DIR }}"'
+
+    - name: build_image
+      depends_on:
+        - prep_dump_dir
+      operator:
+        name: server_sqsh_build
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: 1
+      script:
+        - set -euo pipefail
+        - 'echo "Build image: ${{ variables.BUILD_IMAGE }}"'
+        - 'echo "TRT-LLM repo: ${{ variables.TRTLLM_REPO }}"'
+        - 'echo "CUDA archs:   ${{ variables.CUDA_ARCHS }}"'
+        - 'echo "Output sqsh:  ${{ variables.SQSH_FILE }}"'
+        - cd ${{ variables.TRTLLM_REPO }}
+        # 1) compile + install TensorRT-LLM (incl. VisualGen TE FP8 backend) for sm100+sm103 only
+        - >
+          python3 ./scripts/build_wheel.py
+          ${{ variables.BUILD_WHEEL_ARGS }}
+          -a "${{ variables.CUDA_ARCHS }}"
+        # 2) clean the base image's conflicting cutlass-dsl (mirrors Dockerfile.multi:
+        #    the base ships a cutlass-dsl whose symbols don't match the built wheel,
+        #    causing ImportError in cute_dsl_custom_ops). Also drop any stale trtllm.
+        - pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy tensorrt_llm || true
+        - rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*
+        # 3) install TRT-LLM's own runtime requirements (authoritative: blake3,
+        #    cutlass-dsl==4.5.0, modelopt, tensorrt, ...) + the VisualGen-only extra.
+        - pip install --no-cache-dir -r requirements.txt
+        - pip install --no-cache-dir sageattention==1.0.6
+        # 4) INSTALL the freshly-built wheel (--no-deps: deps are pinned by
+        #    requirements above, so pip can't pull a mismatched cutlass-dsl).
+        #    build_wheel.py only BUILDS the wheel; this is what puts tensorrt_llm
+        #    (incl. the compiled VisualGen TE backend) into the saved image.
+        - pip install --no-cache-dir --no-deps "$(ls -t build/tensorrt_llm-*.whl | head -1)"
+        # 5) sanity-check the INSTALLED package from OUTSIDE the repo (cd /).
+        - cd /
+        # Check the actual Literal members (get_args), NOT a substring of the
+        # annotation repr — 'TE' is a substring of 'CUTEDSL', so `'TE' in str(...)`
+        # false-passes on a build that lacks the TE backend.
+        # Also assert FA4: the x72 full-rack SingleStream replica sets backend: FA4
+        # (2D context parallel needs an LSE-capable backend; TE can't do CP). FA4 is
+        # the dynamic CuTe-JIT path that imports flash_attn.cute (pip flash-attn-4,
+        # requirements.txt), so a build that didn't install it would pass a TE-only
+        # check yet reject backend: FA4 at runtime. Verify both the Literal member
+        # AND that flash_attn.cute actually imports.
+        # HARD, CUDA-free FA4-dep guard: fails the build if flash-attn-4 (FA4's
+        # CuTe-JIT dep) wasn't installed, independent of GPU availability.
+        - python3 -c "import importlib.metadata as m; print('flash-attn-4', m.version('flash-attn-4'), 'present (FA4 dep)')"
+        - python3 -c "import tensorrt_llm, tensorrt_llm.visual_gen.args as a; from typing import get_args; b=get_args(a.AttentionConfig.model_fields['backend'].annotation); assert 'TE' in b, f'TE backend missing; got {b}'; assert 'FA4' in b, f'FA4 backend missing; got {b}'; import importlib; importlib.import_module('flash_attn.cute.interface'); print('TRT-LLM', tensorrt_llm.__version__, '+ VisualGen TE+FA4 OK')"
+        - 'echo "build complete; pyxis will --container-save to ${{ variables.SQSH_FILE }}"'

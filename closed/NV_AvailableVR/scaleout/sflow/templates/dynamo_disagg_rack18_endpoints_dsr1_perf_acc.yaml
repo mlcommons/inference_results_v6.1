@@ -1,0 +1,424 @@
+# DeepSeek-R1, Vera Rubin NVL72 (72 GPUs): one rack, four prefill/decode pairs. TensorRT-LLM workers (dynamo.trtllm) behind
+# NVIDIA Dynamo frontends (dynamo.frontend), etcd/nats, the LiveCodeBench grader and the MLPerf
+# Endpoints client (MODE: perf, acc or both = performance then accuracy). The HBM clock is pinned
+# (MEM_CLOCK_MHZ) before the servers start. Compose with a scenario's deepseek_config_sflow.yaml
+# and slurm_env_sflow.yaml.
+version: "0.1"
+
+artifacts:
+  - name: FRONTEND_URLS
+    uri: file://frontend_urls.txt
+    content: ""
+
+workflow:
+  name: dynamo_disagg_rack18_dsr1_perf_acc
+  variables:
+    CLIENT_NODE_IP:
+      value: ${{ backends.slurm_cluster.nodes[variables.CLIENT_NODE_INDEX | int].ip_address }}
+  tasks:
+    - name: snapshot_configs
+      resources:
+        nodes:
+          count: 1
+      operator:
+        name: host_bash
+      script:
+        - set -euo pipefail
+        - cp "${TRTLLM_YAML_CTX}" "${SFLOW_TASK_OUTPUT_DIR}/server-ctx.yaml"
+        - cp "${TRTLLM_ENV_YAML_CTX}" "${SFLOW_TASK_OUTPUT_DIR}/server-ctx-env.yaml"
+        - cp "${TRTLLM_YAML_GEN}" "${SFLOW_TASK_OUTPUT_DIR}/server-gen.yaml"
+        - cp "${TRTLLM_ENV_YAML_GEN}" "${SFLOW_TASK_OUTPUT_DIR}/server-gen-env.yaml"
+        - cp "${ENDPOINT_CONFIG}" "${SFLOW_TASK_OUTPUT_DIR}/client.yaml"
+        - cp "${ENDPOINT_ENV_YAML}" "${SFLOW_TASK_OUTPUT_DIR}/endpoint-env.yaml"
+        - echo "server_image=${CONTAINER_IMAGE} client_image=${ENDPOINT_CONTAINER_IMAGE} lcb_image=${LCB_CONTAINER_IMAGE} model=${MODEL_PATH} data=${DATA_PATH} mode=${MODE} ctx=${NUM_CTX_SERVERS}x${GPUS_PER_CTX_RANK} gen=${NUM_GEN_SERVERS}x${GPUS_PER_GEN_RANK} fe=${NUM_FRONTEND_SERVERS} router=[${FRONTEND_ROUTER_ARGS}] nodes=${SLURM_NODES} segment=${SEGMENT}" > "${SFLOW_TASK_OUTPUT_DIR}/run-meta.txt"
+
+    - name: hbm_clock
+      operator:
+        name: host_srun
+        ntasks: ${{ variables.SLURM_NODES }}
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: ${{ variables.SLURM_NODES }}
+      script:
+        - set -euo pipefail
+        - |
+          C=${{ variables.MEM_CLOCK_MHZ }}
+          if [ "$C" = 0 ]; then echo "HBM clock not pinned"; exit 0; fi
+          for i in 1 2 3 4 5 6; do sudo -n nvidia-smi -lmc $C,$C > /dev/null 2>&1 || true; sleep 5; done
+          nvidia-smi --query-gpu=index,clocks.mem --format=csv,noheader | sed "s/^/$(hostname -s) /"
+          BAD=$(nvidia-smi --query-gpu=clocks.mem --format=csv,noheader,nounits | awk -v c="$C" '$1 != c' | wc -l)
+          if [ "$BAD" != 0 ]; then echo "HBM_CLOCK_FAIL $(hostname -s)"; exit 1; fi
+          echo "HBM_CLOCK_OK $(hostname -s) $C MHz"
+
+    - name: dyn_infra
+      operator:
+        name: trtllm_disagg_container
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          indices:
+            - ${{ variables.CLIENT_NODE_INDEX }}
+      depends_on:
+        - hbm_clock
+      script:
+        - set -euo pipefail
+        - D="/tmp/dsr1-dyn-${SLURM_JOB_ID}"; rm -rf "$D"; mkdir -p "$D"
+        - nats-server -js -a 0.0.0.0 -p ${{ variables.NATS_PORT }} --store_dir "$D/nats" > "${SFLOW_TASK_OUTPUT_DIR}/nats.log" 2>&1 &
+        - NATS_PID=$!
+        - etcd --data-dir "$D/etcd" --listen-client-urls http://0.0.0.0:${{ variables.ETCD_PORT }} --advertise-client-urls "http://${CLIENT_NODE_IP}:${{ variables.ETCD_PORT }}" --listen-peer-urls http://0.0.0.0:$(( ${{ variables.ETCD_PORT }} + 1 )) --initial-advertise-peer-urls "http://${CLIENT_NODE_IP}:$(( ${{ variables.ETCD_PORT }} + 1 ))" --initial-cluster "default=http://${CLIENT_NODE_IP}:$(( ${{ variables.ETCD_PORT }} + 1 ))" > "${SFLOW_TASK_OUTPUT_DIR}/etcd.log" 2>&1 &
+        - ETCD_PID=$!
+        - |
+          for i in $(seq 1 60); do
+            if python3 -c "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (${{ variables.ETCD_PORT }}, ${{ variables.NATS_PORT }})]" 2>/dev/null; then
+              echo "DYN_INFRA_READY etcd=${CLIENT_NODE_IP}:${{ variables.ETCD_PORT }} nats=${CLIENT_NODE_IP}:${{ variables.NATS_PORT }}"; break
+            fi
+            sleep 2
+          done
+        - wait -n "$NATS_PID" "$ETCD_PID" || true
+        - echo "DYN_INFRA_EXITED"; tail -20 "${SFLOW_TASK_OUTPUT_DIR}/nats.log" "${SFLOW_TASK_OUTPUT_DIR}/etcd.log"; exit 1
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: DYN_INFRA_READY
+          timeout: 600
+          interval: 5
+        failure:
+          log_watch:
+            regex_pattern: DYN_INFRA_EXITED
+
+    - name: prefill_a
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_CTX_RANK }}
+        nodes:
+          indices: [0]
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_CTX_RANK }}
+        ntasks_per_node: ${{ variables.GPUS_PER_CTX_RANK }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-a DYN_ROLE=prefill ENGINE_YAML="${TRTLLM_YAML_CTX}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_CTX}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: decode_a
+      replicas:
+        count: ${{ variables.GEN_REPLICAS_PER_PAIR }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_GEN_RANK }}
+        nodes:
+          indices: [2, 3, 4, 5]
+          count: ${{ variables.GEN_NODES_PER_REPLICA }}
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_GEN_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_GEN_RANK, variables.GPUS_PER_NODE] | min }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-a DYN_ROLE=decode ENGINE_YAML="${TRTLLM_YAML_GEN}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_GEN}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: prefill_b
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_CTX_RANK }}
+        nodes:
+          indices: [0]
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_CTX_RANK }}
+        ntasks_per_node: ${{ variables.GPUS_PER_CTX_RANK }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-b DYN_ROLE=prefill ENGINE_YAML="${TRTLLM_YAML_CTX}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_CTX}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: decode_b
+      replicas:
+        count: ${{ variables.GEN_REPLICAS_PER_PAIR }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_GEN_RANK }}
+        nodes:
+          indices: [6, 7, 8, 9]
+          count: ${{ variables.GEN_NODES_PER_REPLICA }}
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_GEN_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_GEN_RANK, variables.GPUS_PER_NODE] | min }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-b DYN_ROLE=decode ENGINE_YAML="${TRTLLM_YAML_GEN}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_GEN}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: prefill_c
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_CTX_RANK }}
+        nodes:
+          indices: [1]
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_CTX_RANK }}
+        ntasks_per_node: ${{ variables.GPUS_PER_CTX_RANK }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-c DYN_ROLE=prefill ENGINE_YAML="${TRTLLM_YAML_CTX}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_CTX}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: decode_c
+      replicas:
+        count: ${{ variables.GEN_REPLICAS_PER_PAIR }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_GEN_RANK }}
+        nodes:
+          indices: [10, 11, 12, 13]
+          count: ${{ variables.GEN_NODES_PER_REPLICA }}
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_GEN_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_GEN_RANK, variables.GPUS_PER_NODE] | min }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-c DYN_ROLE=decode ENGINE_YAML="${TRTLLM_YAML_GEN}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_GEN}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: prefill_d
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_CTX_RANK }}
+        nodes:
+          indices: [1]
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_CTX_RANK }}
+        ntasks_per_node: ${{ variables.GPUS_PER_CTX_RANK }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-d DYN_ROLE=prefill ENGINE_YAML="${TRTLLM_YAML_CTX}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_CTX}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: decode_d
+      replicas:
+        count: ${{ variables.GEN_REPLICAS_PER_PAIR }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.GPUS_PER_GEN_RANK }}
+        nodes:
+          indices: [14, 15, 16, 17]
+          count: ${{ variables.GEN_NODES_PER_REPLICA }}
+      operator:
+        name: trtllm_disagg_container
+        ntasks: ${{ variables.GPUS_PER_GEN_RANK }}
+        ntasks_per_node: ${{ [variables.GPUS_PER_GEN_RANK, variables.GPUS_PER_NODE] | min }}
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export DYN_NAMESPACE=pair-d DYN_ROLE=decode ENGINE_YAML="${TRTLLM_YAML_GEN}" WORKER_ENV_YAML="${TRTLLM_ENV_YAML_GEN}"
+        - exec bash ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_trtllm_worker.sh
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Registered base model"
+          timeout: 3600
+          interval: 10
+        failure:
+          log_watch:
+            regex_pattern: 're:CUDA out of memory|OutOfMemoryError|illegal memory access|RuntimeError: Executor|MPI_ABORT|Segmentation fault|Address already in use|NIXL_ERR_BACKEND|Error in kv cache transfer|WORKER_PREEXEC_FAILED'
+
+    - name: frontend_server
+      replicas:
+        count: ${{ variables.NUM_FRONTEND_SERVERS }}
+        policy: parallel
+      resources:
+        nodes:
+          indices:
+            - ${{ variables.CLIENT_NODE_INDEX }}
+      operator:
+        name: trtllm_disagg_container
+        ntasks: 1
+        ntasks_per_node: 1
+      depends_on:
+        - dyn_infra
+      script:
+        - set -euo pipefail
+        - export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+        - export HOME="/tmp/dsr1-fe-${SLURM_JOB_ID}-${SFLOW_REPLICA_INDEX}" && mkdir -p "$HOME"
+        - export DYN_NAMESPACE="${{ variables.DYN_NAMESPACE }}" DYN_DISCOVERY_BACKEND=etcd ETCD_ENDPOINTS="http://${CLIENT_NODE_IP}:${{ variables.ETCD_PORT }}" NATS_SERVER="nats://${CLIENT_NODE_IP}:${{ variables.NATS_PORT }}" DYN_REQUEST_PLANE=tcp
+        - export DYN_TCP_REQUEST_TIMEOUT=60
+        - export DYN_LOG="${FRONTEND_DYN_LOG:-warn}"
+        - FE_ENV="${TRTLLM_ENV_YAML_GEN:+$(dirname "${TRTLLM_ENV_YAML_GEN}")/frontend-env.sh}"; if [ -n "$FE_ENV" ] && [ -f "$FE_ENV" ]; then echo "sourcing $FE_ENV"; source "$FE_ENV"; fi
+        - FE_PORT=$(( ${{ variables.FRONTEND_PORT }} + ${SFLOW_REPLICA_INDEX} ))
+        - echo "${CLIENT_NODE_IP}:${FE_PORT}" >> ${{ artifacts.FRONTEND_URLS.path }}
+        - exec python3 -m dynamo.frontend --http-host 0.0.0.0 --http-port "${FE_PORT}" ${{ variables.FRONTEND_ROUTER_ARGS }}
+      probes:
+        readiness:
+          tcp_port:
+            port: ${{ variables.FRONTEND_PORT }}
+          timeout: 900
+          interval: 5
+        failure:
+          log_watch:
+            regex_pattern: 're:panicked at|Address already in use'
+
+    - name: lcb_service
+      operator:
+        name: lcb_container
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          indices:
+            - ${{ variables.CLIENT_NODE_INDEX }}
+      script:
+        - set -euo pipefail
+        - 'echo "lcb_service starting on port 13835 (localhost)"'
+        - cd /app
+        - /app/venv/bin/uvicorn server:app --host 0.0.0.0 --port 13835 --timeout-keep-alive 7200 --ws-ping-interval 30 --ws-ping-timeout 10
+      probes:
+        readiness:
+          log_watch:
+            regex_pattern: "Uvicorn running"
+          timeout: 600
+          interval: 5
+
+    - name: endpoint_benchmark
+      operator:
+        name: endpoint_container
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          indices:
+            - ${{ variables.CLIENT_NODE_INDEX }}
+      script:
+        - set -euo pipefail
+        - export PYTHONNOUSERSITE=1
+        - FRONTEND_URLS_LIST=$(grep -v '^[[:space:]]*$' ${{ artifacts.FRONTEND_URLS.path }} | sort -u | paste -sd ',')
+        - 'if [ "${{ variables.CLIENT_URL_HOST }}" != "node" ]; then FRONTEND_URLS_LIST=$(echo "${FRONTEND_URLS_LIST}" | sed -E "s/[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+:/${{ variables.CLIENT_URL_HOST }}:/g"); fi'
+        - 'echo "FRONTEND_URLS_LIST=${FRONTEND_URLS_LIST}"'
+        - >
+          /opt/venv/bin/python3 ${{ variables.WORK_DIR }}/scaleout/sflow/tools/dynamo_ready.py
+          --frontend-urls "${FRONTEND_URLS_LIST}" --model "${{ variables.SERVED_MODEL_NAME }}"
+          --num-prefill ${{ variables.NUM_CTX_SERVERS }} --num-decode ${{ variables.NUM_GEN_SERVERS }}
+        - RESOLVED_ENDPOINT_YAML=${SFLOW_TASK_OUTPUT_DIR}/endpoint_resolved.yaml
+        - >
+          /opt/venv/bin/python3 ${{ variables.WORK_DIR }}/scaleout/sflow/tools/generate_endpoint_yaml.py
+          --input ${{ variables.ENDPOINT_CONFIG }}
+          --frontend-urls "${FRONTEND_URLS_LIST}"
+          --output "${RESOLVED_ENDPOINT_YAML}"
+        - ENV_EXPORTS=$(/opt/venv/bin/python3 ${{ variables.WORK_DIR }}/scaleout/sflow/tools/run_with_env.py ${{ variables.ENDPOINT_ENV_YAML }} | tee /dev/stderr)
+        - eval "${ENV_EXPORTS}"
+        - RC=0; /opt/venv/bin/inference-endpoint benchmark from-config -c "${RESOLVED_ENDPOINT_YAML}" --mode "${{ variables.MODE }}" 2>&1 | stdbuf -o0 tr '\r' '\n' || RC=$?
+        - echo "BENCHMARK_CLIENT_EXIT rc=${RC}"; exit "${RC}"
+      depends_on:
+        - frontend_server
+        - prefill_a
+        - prefill_b
+        - prefill_c
+        - prefill_d
+        - decode_a
+        - decode_b
+        - decode_c
+        - decode_d
+        - lcb_service
+
+    - name: hbm_clock_release
+      operator:
+        name: host_srun
+        ntasks: ${{ variables.SLURM_NODES }}
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          count: ${{ variables.SLURM_NODES }}
+      script:
+        - if [ "${{ variables.MEM_CLOCK_MHZ }}" != 0 ]; then sudo -n nvidia-smi -rmc > /dev/null 2>&1 || true; fi
+        - echo "HBM clock released $(hostname -s)"
+      depends_on:
+        - endpoint_benchmark

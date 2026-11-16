@@ -1,4 +1,4 @@
-# MLPerf Inference v6.1 NVIDIA-Optimized Implementations
+# MLPerf Inference v6.0 NVIDIA-Optimized Implementations
 
 This is a repository of NVIDIA-optimized implementations for the [MLPerf](https://mlcommons.org/en/) Inference Benchmark.
 This README is a quickstart tutorial on how to use our code as a public / external user.
@@ -174,7 +174,7 @@ Make sure that your user is in docker group already. If you get permission issue
 
 **Datacenter systems:**
 
-Starting v6.1, we recommend using SLURM with Pyxis/Enroot workflow to run multi-node scale-out experiments.
+Starting v6.0, we recommend using SLURM with Pyxis/Enroot workflow to run multi-node scale-out experiments.
 
 Some of our submissions use Docker to set up the environment. Requirements are:
 
@@ -190,7 +190,7 @@ $ sudo systemctl restart docker
 - [nvidia-docker](https://github.com/NVIDIA/nvidia-docker)
   - libnvidia-container >= 1.4.0
 - NVIDIA Driver Version 550.xx or greater
-  - For v6.1 submission, we recommend driver version 550.xx or greater
+  - For v6.0 submission, we recommend driver version 550.xx or greater
 
 #### NUMA Configuration
 

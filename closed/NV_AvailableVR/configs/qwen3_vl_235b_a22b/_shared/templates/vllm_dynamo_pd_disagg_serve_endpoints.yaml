@@ -1,0 +1,387 @@
+# vLLM + Dynamo P/D disaggregated endpoints workflow. Brings up etcd,
+# NATS, dynamo.frontend, prefill workers, decode workers, then drives a
+# benchmark from the inference-endpoint client.
+
+version: "0.1"
+
+variables:
+  NUM_PREFILL_WORKERS:
+    description: "Number of Dynamo/vLLM prefill workers."
+    type: integer
+    value: 1
+  NUM_DECODE_WORKERS:
+    description: "Number of Dynamo/vLLM decode workers."
+    type: integer
+    value: 4
+  PREFILL_TENSOR_PARALLEL_SIZE:
+    type: integer
+    value: 4
+  DECODE_TENSOR_PARALLEL_SIZE:
+    type: integer
+    value: 1
+  GPUS_PER_NODE:
+    type: integer
+    value: 4
+
+# The following variables are auto calculated from the number of prefill/decode workers and prefill/decode worker tensor
+# parallel size. They are not supposed to be manually altered for a correct topology and resource allocation.
+
+  PREFILL_GPUS_PER_WORKER:
+    description: "GPUs assigned to each prefill worker. Must match prefill TP."
+    type: integer
+    value: ${{ variables.PREFILL_TENSOR_PARALLEL_SIZE }}
+  DECODE_GPUS_PER_WORKER:
+    description: "GPUs assigned to each decode worker. Must match decode TP."
+    type: integer
+    value: ${{ variables.DECODE_TENSOR_PARALLEL_SIZE }}
+  TOTAL_GPUS:
+    description: "Total worker GPUs across prefill + decode roles."
+    type: integer
+    value: ${{ variables.NUM_PREFILL_WORKERS * variables.PREFILL_GPUS_PER_WORKER + variables.NUM_DECODE_WORKERS * variables.DECODE_GPUS_PER_WORKER }}
+  PREFILL_WORKERS_PER_NODE:
+    description: "Prefill worker replicas that fit on one node."
+    type: integer
+    value: ${{ variables.GPUS_PER_NODE // variables.PREFILL_GPUS_PER_WORKER }}
+  DECODE_WORKERS_PER_NODE:
+    description: "Decode worker replicas that fit on one node."
+    type: integer
+    value: ${{ variables.GPUS_PER_NODE // variables.DECODE_GPUS_PER_WORKER }}
+  PREFILL_NUM_NODES:
+    description: "Nodes needed by prefill workers when packed by GPU capacity."
+    type: integer
+    value: ${{ ((variables.NUM_PREFILL_WORKERS / variables.PREFILL_WORKERS_PER_NODE) | round(0, "ceil")) | int }}
+  DECODE_NUM_NODES:
+    description: "Nodes needed by decode workers when packed by GPU capacity."
+    type: integer
+    value: ${{ ((variables.NUM_DECODE_WORKERS / variables.DECODE_WORKERS_PER_NODE) | round(0, "ceil")) | int }}
+  NUM_NODES:
+    description: "Total Slurm nodes reserved for prefill and decode role pools."
+    type: integer
+    value: ${{ variables.PREFILL_NUM_NODES + variables.DECODE_NUM_NODES }}
+
+
+  WORKFLOW_TIMEOUT:
+    description: "Wall-clock cap (must be < slurm walltime). Duration string like '60m' or '3h'."
+    value: "60m"
+  READINESS_TIMEOUT:
+    type: integer
+    value: 3600
+
+  MODEL_REPO_ID:
+    description: "HuggingFace repo id passed to `dynamo.vllm --model`."
+    value: ""
+  MODEL_REVISION:
+    value: "main"
+  HF_TOKEN:
+    value: ""
+
+  COMMON_VLLM_FLAGS:
+    description: "Flags forwarded to every `python3 -m dynamo.vllm` worker. Do not put TP here; use the role-specific tensor-parallel variables. DP is controlled by replica counts."
+    value: ""
+  PREFILL_VLLM_FLAGS:
+    description: "Role-specific flags forwarded only to prefill workers."
+    value: ""
+  DECODE_VLLM_FLAGS:
+    description: "Role-specific flags forwarded only to decode workers."
+    value: ""
+  WORKER_ENV_YAML:
+    description: "Path inside the container to a flat `KEY: value` YAML of worker env vars."
+    value: ""
+  DYNAMO_FRONTEND_FLAGS:
+    description: "Flags forwarded to `python3 -m dynamo.frontend` after --http-host / --http-port."
+    value: "--router-mode=kv --router-reset-states"
+  DYN_REQUEST_PLANE:
+    description: "Dynamo request plane. Use tcp for multimodal payloads."
+    value: "tcp"
+  FRONTEND_DYN_LOG:
+    description: "Dynamo log level for the frontend process. Backend readiness is checked through /health, so this can stay quiet."
+    value: "error"
+  FRONTEND_RUST_LOG:
+    description: "Rust log level for the frontend process. Backend readiness is checked through /health, so this can stay quiet."
+    value: "error"
+
+  SERVED_PORT:
+    type: integer
+    value: 8000
+
+  ENDPOINT_CONFIG:
+    description: "Path to the inference-endpoint benchmark config yaml inside the container."
+    value: ""
+
+workflow:
+  name: vllm_dynamo_pd_disagg_serve_endpoints
+  timeout: ${{ variables.WORKFLOW_TIMEOUT }}
+  variables:
+    HEAD_NODE_IP:
+      value: "${{ backends.slurm_cluster.nodes[0].ip_address }}"
+    ETCD_URL:
+      value: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:2379"
+    NATS_URL:
+      value: "nats://${{ backends.slurm_cluster.nodes[0].ip_address }}:4222"
+    FRONTEND_URL:
+      value: "http://${{ backends.slurm_cluster.nodes[0].ip_address }}:${{ variables.SERVED_PORT }}"
+
+  tasks:
+    - name: load_image
+      operator:
+        name: test_container
+        ntasks: ${{ variables.NUM_NODES }}
+        ntasks_per_node: 1
+      script:
+        - echo "Image Loaded"
+        - sleep 86400
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Image Loaded"
+            match_count: ${{ variables.NUM_NODES }}
+          timeout: ${{ variables.READINESS_TIMEOUT }}
+          interval: 2
+
+    - name: nats_server
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - >
+          nats-server -js
+          -a ${{ variables.HEAD_NODE_IP }}
+          -p 4222
+          -m 8222
+      probes:
+        readiness:
+          tcp_port:
+            port: 4222
+            host: "${{ variables.HEAD_NODE_IP }}"
+            on_node: first
+          timeout: ${{ variables.READINESS_TIMEOUT }}
+          interval: 5
+      depends_on:
+        - load_image
+
+    - name: etcd_server
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - >
+          etcd
+          --listen-client-urls ${{ variables.ETCD_URL }}
+          --advertise-client-urls ${{ variables.ETCD_URL }}
+          --data-dir /tmp/etcd
+      probes:
+        readiness:
+          tcp_port:
+            port: 2379
+            host: "${{ variables.HEAD_NODE_IP }}"
+            on_node: first
+          timeout: ${{ variables.READINESS_TIMEOUT }}
+          interval: 5
+      depends_on:
+        - load_image
+
+    - name: frontend_server
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: frontend_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - export ETCD_ENDPOINTS=${{ variables.ETCD_URL }}
+        - export NATS_SERVER=${{ variables.NATS_URL }}
+        - export PYTHONHASHSEED=0
+        - export DYN_REQUEST_PLANE=${{ variables.DYN_REQUEST_PLANE }}
+        - export DYN_TCP_REQUEST_TIMEOUT=300
+        - export DYN_TCP_CONNECT_TIMEOUT=20
+        - export DYN_TCP_POOL_SIZE=1024
+        - export DYN_TCP_CHANNEL_BUFFER=2048
+        - export TOKIO_WORKER_THREADS=64
+        - export DYN_LOG=${{ variables.FRONTEND_DYN_LOG }}
+        - export RUST_LOG=${{ variables.FRONTEND_RUST_LOG }}
+        - 'if [ -n "${{ variables.HF_TOKEN }}" ]; then export HF_TOKEN=${{ variables.HF_TOKEN }}; fi'
+        - >
+          python3 -m dynamo.frontend
+          --http-host 0.0.0.0
+          --http-port ${{ variables.SERVED_PORT }}
+          ${{ variables.DYNAMO_FRONTEND_FLAGS }}
+      probes:
+        readiness:
+          http_get:
+            url: "${{ variables.FRONTEND_URL }}/health"
+          timeout: ${{ variables.READINESS_TIMEOUT }}
+          interval: 5
+      depends_on:
+        - nats_server
+        - etcd_server
+
+    - name: prefill_worker
+      replicas:
+        count: ${{ variables.NUM_PREFILL_WORKERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.PREFILL_GPUS_PER_WORKER }}
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - export ETCD_ENDPOINTS=${{ variables.ETCD_URL }}
+        - export NATS_SERVER=${{ variables.NATS_URL }}
+        - export PYTHONHASHSEED=0
+        - export DYN_REQUEST_PLANE=${{ variables.DYN_REQUEST_PLANE }}
+        - 'if [ -n "${{ variables.HF_TOKEN }}" ]; then export HF_TOKEN=${{ variables.HF_TOKEN }}; fi'
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((5557 + SFLOW_REPLICA_INDEX))
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.WORKER_ENV_YAML }} | tee /dev/stderr)"
+        - NUMA_NODE=$(python3 /work/scaleout/sflow/tools/get_gpu_numa.py)
+        - 'echo "[prefill_worker $SFLOW_REPLICA_INDEX] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NUMA_NODE=$NUMA_NODE VLLM_NIXL_SIDE_CHANNEL_PORT=$VLLM_NIXL_SIDE_CHANNEL_PORT"'
+        - HF_TOKEN_FLAG=""; if [ -n "${{ variables.HF_TOKEN }}" ]; then HF_TOKEN_FLAG="--hf-token ${{ variables.HF_TOKEN }}"; fi
+        - >
+          numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE}
+          python3 -m dynamo.vllm
+          --model ${{ variables.MODEL_REPO_ID }}
+          --revision ${{ variables.MODEL_REVISION }}
+          ${HF_TOKEN_FLAG}
+          ${{ variables.COMMON_VLLM_FLAGS }}
+          --tensor-parallel-size ${{ variables.PREFILL_TENSOR_PARALLEL_SIZE }}
+          ${{ variables.PREFILL_VLLM_FLAGS }}
+          --disaggregation-mode prefill
+          --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
+      depends_on:
+        - nats_server
+        - etcd_server
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Registered endpoint 'dynamo.prefill.generate'"
+            match_count: 1
+          timeout: ${{ variables.READINESS_TIMEOUT }}
+          interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 3
+          interval: 30
+
+    - name: decode_worker
+      replicas:
+        count: ${{ variables.NUM_DECODE_WORKERS }}
+        policy: parallel
+      resources:
+        gpus:
+          count: ${{ variables.DECODE_GPUS_PER_WORKER }}
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - export ETCD_ENDPOINTS=${{ variables.ETCD_URL }}
+        - export NATS_SERVER=${{ variables.NATS_URL }}
+        - export PYTHONHASHSEED=0
+        - export DYN_REQUEST_PLANE=${{ variables.DYN_REQUEST_PLANE }}
+        - 'if [ -n "${{ variables.HF_TOKEN }}" ]; then export HF_TOKEN=${{ variables.HF_TOKEN }}; fi'
+        - export VLLM_NIXL_SIDE_CHANNEL_PORT=$((6000 + SFLOW_REPLICA_INDEX))
+        - eval "$(python3 /work/scaleout/sflow/tools/run_with_env.py ${{ variables.WORKER_ENV_YAML }} | tee /dev/stderr)"
+        - NUMA_NODE=$(python3 /work/scaleout/sflow/tools/get_gpu_numa.py)
+        - 'echo "[decode_worker $SFLOW_REPLICA_INDEX] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NUMA_NODE=$NUMA_NODE VLLM_NIXL_SIDE_CHANNEL_PORT=$VLLM_NIXL_SIDE_CHANNEL_PORT"'
+        - HF_TOKEN_FLAG=""; if [ -n "${{ variables.HF_TOKEN }}" ]; then HF_TOKEN_FLAG="--hf-token ${{ variables.HF_TOKEN }}"; fi
+        - >
+          numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE}
+          python3 -m dynamo.vllm
+          --model ${{ variables.MODEL_REPO_ID }}
+          --revision ${{ variables.MODEL_REVISION }}
+          ${HF_TOKEN_FLAG}
+          ${{ variables.COMMON_VLLM_FLAGS }}
+          --tensor-parallel-size ${{ variables.DECODE_TENSOR_PARALLEL_SIZE }}
+          ${{ variables.DECODE_VLLM_FLAGS }}
+          --disaggregation-mode decode
+          --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
+      depends_on:
+        - nats_server
+        - etcd_server
+      probes:
+        readiness:
+          log_watch:
+            match_pattern: "Registered endpoint 'dynamo.backend.generate'"
+            match_count: 1
+          timeout: ${{ variables.READINESS_TIMEOUT }}
+          interval: 10
+        failure:
+          log_watch:
+            match_pattern: "Traceback (most recent call last)"
+            match_count: 3
+          interval: 30
+
+    - name: wait_for_backends
+      resources:
+        nodes:
+          indices: [0]
+      operator:
+        name: test_container
+        ntasks: 1
+        ntasks_per_node: 1
+      script:
+        - |
+          python3 - <<'PYEOF'
+          import json, sys, time, urllib.request
+          url = "${{ variables.FRONTEND_URL }}/health"
+          required = ${{ variables.NUM_PREFILL_WORKERS + variables.NUM_DECODE_WORKERS }}
+          deadline = time.monotonic() + ${{ variables.READINESS_TIMEOUT }}
+
+          def is_generate_instance(instance):
+              endpoint = str(instance.get("endpoint") or "")
+              return endpoint == "generate" or endpoint.endswith(".generate")
+
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=5) as r:
+                      data = json.loads(r.read())
+                  instances = data.get("instances") or []
+                  generate = [i for i in instances if is_generate_instance(i)]
+                  print(
+                      f"[wait_for_backends] generate={len(generate)}/{required}; "
+                      f"instances={instances}",
+                      flush=True,
+                  )
+                  if len(generate) >= required:
+                      sys.exit(0)
+              except Exception as e:
+                  print(f"[wait_for_backends] poll error: {e}", flush=True)
+              time.sleep(5)
+          print("[wait_for_backends] timed out waiting for generate backends", file=sys.stderr)
+          sys.exit(1)
+          PYEOF
+      depends_on:
+        - frontend_server
+        - prefill_worker
+        - decode_worker
+
+    - name: endpoint_benchmark
+      operator:
+        name: endpoint_sqsh
+        ntasks: 1
+        ntasks_per_node: 1
+      resources:
+        nodes:
+          indices: [0]
+      script:
+        - set -euo pipefail
+        - export FRONTEND_URL=http://127.0.0.1:${{ variables.SERVED_PORT }}
+        - export MODEL_NAME=${{ variables.MODEL_REPO_ID }}
+        - 'echo "[endpoint] FRONTEND_URL=$FRONTEND_URL MODEL_NAME=$MODEL_NAME"'
+        - 'echo "[endpoint] ENDPOINT_CONFIG=${{ variables.ENDPOINT_CONFIG }}"'
+        - >
+          /opt/venv/bin/inference-endpoint benchmark from-config
+          -c ${{ variables.ENDPOINT_CONFIG }}
+      depends_on:
+        - wait_for_backends
