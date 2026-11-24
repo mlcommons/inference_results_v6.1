@@ -44,10 +44,27 @@ submission_checker_constants = import_from(
     [paths.MLCOMMONS_INF_REPO / "tools" / "submission" / "submission_checker"] + sys.path,
     "constants"
 )
-_latest_ver = max(versioning.parse(ver_key) for ver_key in submission_checker_constants.MODEL_CONFIG.keys())
-_vstr = f"v{_latest_ver}"
-if _vstr != C.VERSION:
-    logging.warning("Current submission version is %s but latest version in submission checker is %s", C.VERSION, _vstr)
+
+
+def _get_model_config_version(submission_version, model_configs):
+    """Use this harness's MLPerf round, even when the checker knows newer rounds."""
+    try:
+        version = versioning.parse(submission_version)
+        # Package metadata uses e.g. 6.1.0; checker keys use v6.1.
+        version_key = f"v{version.major}.{version.minor}"
+    except versioning.InvalidVersion:
+        version_key = None
+
+    if version_key in model_configs:
+        return version_key
+
+    latest_key = max(model_configs, key=versioning.parse)
+    logging.warning("No model configuration for submission version %s; falling back to %s",
+                    submission_version, latest_key)
+    return latest_key
+
+
+_vstr = _get_model_config_version(C.VERSION, submission_checker_constants.MODEL_CONFIG)
 
 model_config = submission_checker_constants.MODEL_CONFIG[_vstr]
 benchmark_qsl_size_map = model_config["performance-sample-count"].copy()
