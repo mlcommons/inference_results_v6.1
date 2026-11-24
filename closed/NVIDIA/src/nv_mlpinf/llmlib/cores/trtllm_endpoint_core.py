@@ -95,6 +95,13 @@ def _shutdown_module_loop():
     global _shutdown_event
     if _shutdown_event:
         _shutdown_event.set()
+        # Let the daemon thread cancel pending tasks and close its event loop
+        # before atexit returns and interpreter finalization begins.
+        thread = _loop_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=15)
+            if thread.is_alive():
+                logging.warning("Module event loop thread did not stop within 15 seconds")
 
 
 # initialize module loop on import
