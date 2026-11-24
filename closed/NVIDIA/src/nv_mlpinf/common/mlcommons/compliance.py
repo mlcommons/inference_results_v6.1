@@ -62,7 +62,11 @@ def set_audit_conf(audit_test: Optional[AuditTest] = None,
     for fname in audit_files:
         if os.path.exists(fname):
             logging.info(f"Cleaning up leftover audit test file - {fname}")
-            os.remove(fname)
+            try:
+                os.remove(fname)
+            except FileNotFoundError:
+                # Another rank may have removed the file after the existence check.
+                pass
 
     if audit_test is None:
         return
