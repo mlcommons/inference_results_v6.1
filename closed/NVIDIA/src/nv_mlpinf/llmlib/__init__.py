@@ -43,6 +43,7 @@ try:
     from nv_mlpinf.common.workload import Workload
     from nv_mlpinf.fields import general as general_fields
     from nv_mlpinf.fields import harness as harness_fields
+    from nv_mlpinf.fields import models as model_fields
     from nv_mlpinf.fields.harness import CoreType
     from nv_mlpinf.ops.harness import PyHarnessOp
     from nv_mlpinf.ops.loadgen import LoadgenConfFilesOp
@@ -282,18 +283,25 @@ if _HEAVY_IMPORTS_AVAILABLE:
 
 
     @autoconfigure
+    @bind(model_fields.model_path)
     class TrtllmServeClientHarnessOp(LLMHarnessOp):
         """LLM Harness Operation with trtllm-serve endpoint based inference"""
+
+        def __init__(self, *args, model_path: Optional[Path] = None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.model_path = model_path
 
         @classmethod
         def immediate_dependencies(cls):
             return {LoadgenConfFilesOp}
 
         def get_backend_kwargs(self, dependency_outputs):
-            benchmark = TrtllmEndpointConfig().workload.benchmark
-            model_path = str(G_BENCHMARK_MODULES[benchmark].load().MODEL_CHECKPOINT_PATH)
+            model_path = self.model_path
+            if model_path is None:
+                benchmark = self.wl.benchmark
+                model_path = G_BENCHMARK_MODULES[benchmark].load().MODEL_CHECKPOINT_PATH
             return super().get_backend_kwargs(dependency_outputs) | {
-                'model_path': model_path
+                'model_path': str(model_path)
             }
 
 
