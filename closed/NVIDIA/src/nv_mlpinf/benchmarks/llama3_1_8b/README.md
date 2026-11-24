@@ -67,3 +67,10 @@ make run_llm_server RUN_ARGS="--core_type=trtllm_endpoint --benchmarks=llama3.1-
 # Wait for few minutes for server to spin up, see logs
 make run_harness RUN_ARGS="--core_type=trtllm_endpoint --benchmarks=llama3.1-8b --scenarios=Offline"
 ```
+
+The endpoint harness loads its tokenizer from the packaged FP4 checkpoint by default.
+When serving a different checkpoint, pass `--model_path` to `run_harness` with the
+checkpoint directory containing the matching tokenizer files. For example, an FP8
+run can use `--model_path=/path/to/fp8-checkpoint` without requiring a copy of the
+FP4 checkpoint. This selects the client tokenizer location; it does not change
+the model already loaded by the server.
